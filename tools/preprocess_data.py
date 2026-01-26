@@ -6,7 +6,7 @@ import math
 import json
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
 import time
 import gzip
@@ -84,6 +84,11 @@ class Encoder(object):
         output = {}
         for key in self.args.json_keys:
             text = data[key]
+
+            file_path = data.get("file_path")
+            if file_path is not None and isinstance(file_path, str):
+                text = "<file_path>" + file_path + "</file_path>\n" + text
+
             max_len = 1000000
             tokens_list = [Encoder.splitter.tokenize(text[i:i+max_len]) for i in range(0, len(text), max_len)]
             output[key] = [tokens for partial in tokens_list for tokens in partial]
@@ -95,6 +100,11 @@ class Encoder(object):
         lens = {}
         for key in self.args.json_keys:
             text = data[key]
+
+            file_path = data.get("file_path")
+            if file_path is not None and isinstance(file_path, str):
+                text = "<file_path>" + file_path + "</file_path>\n" + text
+
             if isinstance(text, list):
                 sentences = text
             else:
@@ -107,8 +117,11 @@ class Encoder(object):
                     doc_ids.extend(sentence_ids)
                     sentence_lens.append(len(sentence_ids))
             if len(doc_ids) > 0 and self.args.append_eod:
-                doc_ids.append(Encoder.tokenizer.eod)
+                doc_ids.append(Encoder.tokenizer.eod) # 与eos_id等价
                 sentence_lens[-1] += 1
+            if len(doc_ids) > 0 and self.args.append_bos:
+                doc_ids.insert(0, Encoder.tokenizer.bos_id)
+                sentence_lens[0] += 1
             ids[key] = doc_ids
             lens[key] = sentence_lens
         return ids, lens, len(json_line)
@@ -149,7 +162,7 @@ class Partition(object):
         fout.close()
 
 
-    def process_json_file(self, file_name):
+    def process_json_file(self, file_name, output_dir):
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
         fin = open(input_file_name, 'r', encoding='utf-8')
@@ -172,10 +185,10 @@ class Partition(object):
         builders = {}
 
         for key in self.args.json_keys:
-            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
-                                                          key, level)
-            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
-                                                          key, level)
+            output_bin_files[key] = os.path.join(output_dir, "{}_{}_{}.bin".format(output_prefix,
+                                                          key, level)) 
+            output_idx_files[key] = os.path.join(output_dir, "{}_{}_{}.idx".format(output_prefix,
+                                                          key, level))
             builders[key] = indexed_dataset.IndexedDatasetBuilder(
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
@@ -210,11 +223,15 @@ def get_args():
     group = parser.add_argument_group(title='tokenization process')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
+    group.add_argument('--append-bos', action='store_true',
+                       help='Append a <bos> token to the beginning of a document.')
     group.add_argument('--lang', type=str, default='english',
                        help='Language to use for NLTK-powered sentence splitting.')
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
+    group.add_argument('--output-dir', type=str, required=True,
+                       help='Path to output directory')
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, required=True,
                        help=('Number of worker processes to launch.'
@@ -363,7 +380,7 @@ def main():
     input_key = 'sentence_split' if args.split_sentences else 'partition'
     for name in in_ss_out_names:
         p = multiprocessing.Process(target=partition.process_json_file,
-                                    args=((name[input_key], name['output_prefix']),))
+                                    args=((name[input_key], name['output_prefix']),args.output_dir))
         p.start()
         processes.append(p)
 
@@ -387,10 +404,10 @@ def main():
         tokenizer = build_new_tokenizer(args)
 
     for key in args.json_keys:
-        output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,
-                                                      key, level)
-        output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
-                                                      key, level)
+        output_bin_files[key] = os.path.join(args.output_dir, "{}_{}_{}.bin".format(args.output_prefix,
+                                                      key, level))
+        output_idx_files[key] = os.path.join(args.output_dir, "{}_{}_{}.idx".format(args.output_prefix,
+                                                      key, level))
         builders[key] = indexed_dataset.IndexedDatasetBuilder(
             output_bin_files[key],
             dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
@@ -398,8 +415,8 @@ def main():
 
         for name in in_ss_out_names:
             parition_output_prefix = name['output_prefix']
-            full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,
-                                                             key, level)
+            full_partition_output_prefix = os.path.join(args.output_dir, "{}_{}_{}".format(parition_output_prefix,
+                                                             key, level))
             builders[key].add_index(full_partition_output_prefix)
         builders[key].finalize(output_idx_files[key])
 

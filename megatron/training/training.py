@@ -2004,6 +2004,19 @@ def train(
     # Write args to tensorboard
     write_args_to_tensorboard()
 
+
+    if getattr(args, 'perform_rl_step', False):
+        rl_utils.evaluate_and_print_results_rl(valid_data_iterator, model, optimizer,
+                                args.iteration, write_to_tensorboard=True)
+    else:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            report_theoretical_memory(args, num_microbatches=args.micro_batch_size, verbose=True)
+        evaluate_and_print_results("eval-before-training", forward_step_func,
+                                valid_data_iterator, model,
+                                args.iteration, process_non_loss_data_func,
+                                config, verbose=False, write_to_tensorboard=True,
+                                non_loss_data_func=non_loss_data_func)
+
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
@@ -2307,13 +2320,46 @@ def train(
             params_norm = calc_params_l2_norm(model)
         learning_rate = None
         decoupled_learning_rate = None
+        # NOTE: When using the distributed optimizer, parameter shards are assigned to DP ranks.
+        # It is possible that a rank owns no parameters in a given param_group (params=[]), even
+        # though the scheduler still updates that group's learning rate. We want to log the
+        # scheduled LR values consistently, so we capture a fallback LR from empty groups too.
+        fallback_learning_rate = None
+        fallback_decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
-            if len(param_group['params']) == 0:
+            # Be defensive: older checkpoints / external optimizers may not carry the key.
+            is_decoupled = param_group.get('is_decoupled_lr', False)
+            lr = param_group.get('lr', None)
+            if lr is None:
                 continue
-            if param_group['is_decoupled_lr']:
-                decoupled_learning_rate = param_group['lr']
+
+            params = param_group.get('params', [])
+            has_params = len(params) > 0
+
+            if is_decoupled:
+                fallback_decoupled_learning_rate = lr
+                if has_params:
+                    decoupled_learning_rate = lr
             else:
-                learning_rate = param_group['lr']
+                fallback_learning_rate = lr
+                if has_params:
+                    learning_rate = lr
+
+        # Fall back to scheduled LR values even if this rank owns no params in that group.
+        if learning_rate is None:
+            learning_rate = fallback_learning_rate
+
+        # Match the expectation in `training_log()`: only provide decoupled LR on first/last PP
+        # stage. This keeps the previous behavior for PP>1 while avoiding false None on sharded
+        # optimizers.
+        if args.decoupled_lr is not None and (
+            mpu.is_pipeline_first_stage(ignore_virtual=True)
+            or mpu.is_pipeline_last_stage(ignore_virtual=True)
+        ):
+            if decoupled_learning_rate is None:
+                decoupled_learning_rate = fallback_decoupled_learning_rate
+        else:
+            decoupled_learning_rate = None
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,

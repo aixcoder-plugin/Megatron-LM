@@ -148,6 +148,20 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             f"{num_parameters_in_embedding_layers / 10**9:.2f}"
         )
         print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
+    
+    if args.num_experts is not None and args.moe_router_topk is not None:
+        moe_expert_params = (
+            2 * args.hidden_size * moe_ffn_hidden_size * num_experts * gated_linear_multiplier
+            * num_moe_layers
+        )
+        activation_ratio = args.moe_router_topk / num_experts
+        active_params = (
+            num_total_parameters - moe_expert_params  
+            + moe_expert_params * activation_ratio     
+        )
+        if verbose:
+            print(f"Active parameters per forward pass in billions（MoE）: {active_params / 10**9:.2f}")
+            print(f"Activation ratio（MoE）: {active_params / num_total_parameters * 100:.1f}%")
 
     # Most loaded model shard has (1/pp_size transformer layers + 1 mtp block + 1 embedding layer) / tp_size.
     num_parameters_on_most_loaded_model_shard = (

@@ -689,6 +689,33 @@ class TransformerConfig(ModelParallelConfig):
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""
 
+    ####################
+    # StackMemory (StackTrans)
+    ####################
+    stack_memory_enabled: bool = False
+    """Whether to enable StackMemory between attention and MLP."""
+
+    stack_memory_num_heads: int = 0
+    """Number of StackMemory heads. If 0, defaults to num_attention_heads."""
+
+    stack_memory_slots: int = 8
+    """Number of stack slots per head."""
+
+    stack_memory_dim: int = 0
+    """Stack dimension per head. If 0, defaults to head_dim (hidden_size / stack_memory_num_heads)."""
+
+    ####################
+    # FAN layer (Fourier Analysis Network)
+    ####################
+    fan_qkv_enabled: bool = False
+    """Whether to replace attention linear_qkv projection with FAN layer."""
+
+    fan_p_ratio: float = 0.25
+    """FAN p_ratio in [0, 0.5]. p_dim = int(hidden_size * fan_p_ratio)."""
+
+    fan_use_p_bias: bool = True
+    """Whether to use bias in the FAN fc1 projection (shared for p and g parts)."""
+
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
 
@@ -740,6 +767,53 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        # StackMemory validation (token-wise memory; relies on TP/SP semantics)
+        if self.stack_memory_enabled:
+            sm_heads = self.stack_memory_num_heads or self.num_attention_heads
+            if sm_heads <= 0:
+                raise ValueError(
+                    f"stack_memory_num_heads must be > 0 (or 0 to default), but got {self.stack_memory_num_heads}."
+                )
+            if self.hidden_size % sm_heads != 0:
+                raise ValueError(
+                    f"hidden_size ({self.hidden_size}) must be divisible by stack_memory_num_heads ({sm_heads})."
+                )
+            if self.stack_memory_slots <= 0:
+                raise ValueError(
+                    f"stack_memory_slots must be > 0, but got {self.stack_memory_slots}."
+                )
+            if self.stack_memory_dim < 0:
+                raise ValueError(
+                    f"stack_memory_dim must be >= 0, but got {self.stack_memory_dim}."
+                )
+            # Full activation recomputation would require checkpointing a very large state tensor.
+            if self.recompute_granularity == "full":
+                raise ValueError(
+                    "StackMemory does not support recompute_granularity='full' (state tensor is too large). "
+                    "Use recompute_granularity=None or 'selective'."
+                )
+
+        # FAN-QKV validation
+        if self.fan_qkv_enabled:
+            if not (0.0 <= self.fan_p_ratio <= 0.5):
+                raise ValueError(
+                    f"fan_p_ratio must be within [0, 0.5], but got {self.fan_p_ratio}."
+                )
+            p_dim = int(self.hidden_size * self.fan_p_ratio)
+            fc1_out_dim = self.hidden_size - p_dim
+            if fc1_out_dim <= 0:
+                raise ValueError(
+                    f"Invalid FAN dims: hidden_size={self.hidden_size}, fan_p_ratio={self.fan_p_ratio} "
+                    f"-> p_dim={p_dim}, fc1_out_dim={fc1_out_dim}."
+                )
+            if fc1_out_dim % self.tensor_model_parallel_size != 0:
+                raise ValueError(
+                    f"FAN fc1 output dim (hidden_size - p_dim) must be divisible by "
+                    f"tensor_model_parallel_size. Got fc1_out_dim={fc1_out_dim}, "
+                    f"tensor_model_parallel_size={self.tensor_model_parallel_size}, "
+                    f"hidden_size={self.hidden_size}, p_dim={p_dim}."
+                )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling

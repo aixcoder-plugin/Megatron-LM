@@ -53,6 +53,8 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
+    parser = _add_stack_memory_args(parser)
+    parser = _add_fan_layer_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
     parser = _add_rl_args(parser)
@@ -1628,6 +1630,69 @@ def _add_network_size_args(parser):
                        'We compute the average of the MTP losses across all depths, '
                        'and multiply it the scaling factor to obtain the overall MTP loss, '
                        'which serves as an additional training objective.')
+    return parser
+
+
+def _add_stack_memory_args(parser):
+    group = parser.add_argument_group(title='stack memory')
+
+    group.add_argument(
+        '--stack-memory-enabled',
+        action='store_true',
+        help='Enable StackMemory (StackTrans) module between attention and MLP.',
+        dest='stack_memory_enabled',
+    )
+    group.add_argument(
+        '--stack-memory-num-heads',
+        type=int,
+        default=0,
+        help='Number of StackMemory heads. If 0, defaults to --num-attention-heads.',
+        dest='stack_memory_num_heads',
+    )
+    group.add_argument(
+        '--stack-memory-slots',
+        type=int,
+        default=8,
+        help='Number of stack slots per StackMemory head.',
+        dest='stack_memory_slots',
+    )
+    group.add_argument(
+        '--stack-memory-dim',
+        type=int,
+        default=0,
+        help='Stack dimension per head. If 0, defaults to head_dim (hidden_size / num_heads).',
+        dest='stack_memory_dim',
+    )
+
+    return parser
+
+
+def _add_fan_layer_args(parser):
+    group = parser.add_argument_group(title='fan layer')
+
+    group.add_argument(
+        '--fan-qkv-enabled',
+        '--fan-layer-enabled',
+        action='store_true',
+        help='Enable FAN layer (Fourier Analysis Network) to replace attention linear_qkv projection.',
+        dest='fan_qkv_enabled',
+    )
+    group.add_argument(
+        '--fan-p-ratio',
+        type=float,
+        default=0.25,
+        help='FAN p_ratio in [0, 0.5]. p_dim = int(hidden_size * p_ratio). (Used by FAN-QKV)',
+        dest='fan_p_ratio',
+    )
+    # Default is True; provide a disable flag for convenience (mirrors --no-* patterns).
+    group.add_argument(
+        '--fan-disable-p-bias',
+        action='store_false',
+        help='Disable bias for FAN fc1 projection (shared for p and g parts). (Used by FAN-QKV)',
+        dest='fan_use_p_bias',
+    )
+    group.set_defaults(fan_use_p_bias=True)
+
     return parser
 
 

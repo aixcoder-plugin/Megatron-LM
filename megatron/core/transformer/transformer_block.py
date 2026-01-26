@@ -26,6 +26,7 @@ from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
+from megatron.core.transformer.stack_memory import StackMemoryState
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import (
     WrappedTensor,
@@ -67,6 +68,18 @@ else:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     LayerNormImpl = WrappedTorchNorm
+
+
+def print_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, print only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            print(message, flush=True)
+    elif torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
 
 
 logger = logging.getLogger(__name__)
@@ -284,6 +297,12 @@ class TransformerBlock(MegatronModule):
 
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
+
+        self.stack_memory = None
+        if getattr(self.config, "stack_memory_enabled", False):
+            from megatron.core.transformer.stack_memory import StackMemory
+
+            self.stack_memory = StackMemory(self.config)
 
         self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
         self.post_layer_norm = post_layer_norm
@@ -583,6 +602,16 @@ class TransformerBlock(MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+
+        # JSY TODO: stack_memory_state cant not broadcast across pipeline parallelism, so life cycle is once per forward pass in each pipline group
+        stack_memory_state = StackMemoryState() if self.config.stack_memory_enabled else None
+        if stack_memory_state is not None and (getattr(stack_memory_state, "stack", None) is None or getattr(
+                stack_memory_state, "mask", None
+            ) is None):
+                stack_memory_state.stack, stack_memory_state.mask = self.stack_memory.init_state(
+                    hidden_states
+                )
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -654,6 +683,12 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+
+                        if self.stack_memory is not None and stack_memory_state is not None:
+                            hidden_states, stack_memory_state.stack, stack_memory_state.mask = self.stack_memory(
+                                hidden_states, stack_memory_state.stack, stack_memory_state.mask
+                            )
+                            # print_rank_0("layer {}: stack_memory_state.stack.shape: {}".format(l_no, stack_memory_state.stack.shape))
 
                     if (
                         torch.is_grad_enabled()

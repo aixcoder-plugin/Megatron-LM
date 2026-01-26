@@ -6,9 +6,11 @@ from typing import Optional, Union
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.utils import is_te_min_version
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.fan_layer import FanQKVLinear, FanSubmodules
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
@@ -80,6 +82,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
+    fan_qkv_enabled: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -163,6 +166,16 @@ def get_gpt_layer_with_transformer_engine_spec(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        linear_qkv = backend.column_parallel_layer_norm_linear()
+        if fan_qkv_enabled:
+            linear_qkv = ModuleSpec(
+                module=FanQKVLinear,
+                submodules=FanSubmodules(
+                    linear_fc1=backend.column_parallel_linear(),
+                    linear_fc2=backend.column_parallel_linear(),
+                    activation_func=backend.activation_func() if use_te_activation_func else None,
+                ),
+            )
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -170,7 +183,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                     module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
-                        linear_qkv=backend.column_parallel_layer_norm_linear(),
+                        linear_qkv=linear_qkv,
                         core_attention=backend.core_attention(),
                         linear_proj=backend.row_parallel_linear(),
                         q_layernorm=(
@@ -207,6 +220,7 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    fan_qkv_enabled: bool = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -286,7 +300,17 @@ def get_gpt_layer_local_spec(
                     module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
-                        linear_qkv=backend.column_parallel_linear(),
+                        linear_qkv=(
+                            ModuleSpec(
+                                module=FanQKVLinear,
+                                submodules=FanSubmodules(
+                                    linear_fc1=backend.column_parallel_linear(),
+                                    linear_fc2=backend.column_parallel_linear(),
+                                ),
+                            )
+                            if fan_qkv_enabled
+                            else backend.column_parallel_linear()
+                        ),
                         core_attention=backend.core_attention(),
                         linear_proj=backend.row_parallel_linear(),
                         q_layernorm=(
@@ -421,6 +445,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -431,6 +456,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
         )
     else:
         layer_norm_impl = LNImpl
@@ -443,6 +469,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -453,6 +480,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
