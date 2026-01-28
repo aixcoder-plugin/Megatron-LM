@@ -1691,6 +1691,12 @@ def _add_fan_layer_args(parser):
         help='Disable bias for FAN fc1 projection (shared for p and g parts). (Used by FAN-QKV)',
         dest='fan_use_p_bias',
     )
+    group.add_argument(
+        '--fan-disable-qk-fan',
+        action='store_false',
+        help='Disable qk for FAN fc1 projection (shared for p and g parts).',
+        dest='fan_enable_qk_fan',
+    )
     group.set_defaults(fan_use_p_bias=True)
 
     return parser

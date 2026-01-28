@@ -716,6 +716,9 @@ class TransformerConfig(ModelParallelConfig):
     fan_use_p_bias: bool = True
     """Whether to use bias in the FAN fc1 projection (shared for p and g parts)."""
 
+    fan_enable_qk_fan: bool = True
+    """Whether to enable qk for FAN fc1 projection (shared for p and g parts)."""
+
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
 

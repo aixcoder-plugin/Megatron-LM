@@ -7,6 +7,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.utils import (
+    divide,
     nvtx_range_pop,
     nvtx_range_push,
     get_tensor_model_parallel_group_if_none,
@@ -73,6 +74,10 @@ class FanQKVLinear(MegatronModule):
         self.input_size = input_size
         self.output_size = output_size
 
+        # compatibility with multi-query attention && group-query attention
+        self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
+        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
+
         self.p_ratio = (
             p_ratio if p_ratio is not None else getattr(self.config, "fan_p_ratio", 0.25)
         )
@@ -93,6 +98,13 @@ class FanQKVLinear(MegatronModule):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_group = tp_group
+        self.world_size = get_pg_size(self.tp_group)
+
+        self.hidden_size_per_attention_head = divide(
+            self.query_projection_size, self.config.num_attention_heads
+        )
+        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, self.world_size)
+        self.num_query_groups_per_partition = divide(self.config.num_query_groups, self.world_size)
 
         assert submodules is not None, "FanQKVLinear requires `submodules` to be provided."
         assert (
@@ -124,44 +136,102 @@ class FanQKVLinear(MegatronModule):
         if self.activation_func is not None:
             print_rank_0("WARNING: FanQKVLinear: activation_func is not None")
 
+        self.linear_fc2 = None
+        self.linear_fc2_q = None
+        self.linear_fc2_k = None
+        self.linear_fc2_v = None
+        if self.config.fan_enable_qk_fan:
+            assert skip_bias_add is False, "skip_bias_add must be False for FAN-QKV"
+            self.linear_fc2_q = build_module(
+                submodules.linear_fc2,
+                self.input_size,
+                self.query_projection_size,
+                config=self.config,
+                init_method=init_method,
+                gather_output=gather_output,
+                bias=bias,
+                skip_bias_add=skip_bias_add,
+                is_expert=is_expert,
+                tp_comm_buffer_name=f"{tp_comm_buffer_name}_fan_fc2_q",
+                tp_group=tp_group,
+            )
+            self.linear_fc2_k = build_module(
+                submodules.linear_fc2,
+                self.input_size,
+                self.kv_projection_size,
+                config=self.config,
+                init_method=init_method,
+                gather_output=gather_output,
+                bias=bias,
+                skip_bias_add=skip_bias_add,
+                is_expert=is_expert,
+                tp_comm_buffer_name=f"{tp_comm_buffer_name}_fan_fc2_k",
+                tp_group=tp_group,
+            )
+            self.linear_fc2_v = build_module(
+                submodules.linear_fc2,
+                self.input_size,
+                self.kv_projection_size,
+                config=self.config,
+                init_method=init_method,
+                gather_output=gather_output,
+                bias=bias,
+                skip_bias_add=skip_bias_add,
+                is_expert=is_expert,
+                tp_comm_buffer_name=f"{tp_comm_buffer_name}_fan_fc2_v",
+                tp_group=tp_group,
+            )
 
-        # Final projection keeps the original `linear_qkv` parallel semantics.
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.input_size,
-            self.output_size,
-            config=self.config,
-            init_method=init_method,
-            gather_output=gather_output,
-            bias=bias,
-            skip_bias_add=skip_bias_add,
-            is_expert=is_expert,
-            tp_comm_buffer_name=tp_comm_buffer_name,
-            tp_group=tp_group,
-        )
+            if getattr(self.config, "sequence_parallel", False):
+                self.__set_disable_sequence_parallel(self.linear_fc2_q)
+                self.__set_disable_sequence_parallel(self.linear_fc2_k)
+                # NOTE: Keep sequence-parallel semantics for V.
+                # - Q/K consume `fan_hidden`, which is already full-seq (linear_fc1 does SP all-gather),
+                #   so we must disable SP to avoid gathering again.
+                # - V consumes the original `hidden_states`, which may still be sequence-parallel
+                #   (sharded along dim0), so we keep SP enabled on linear_fc2_v to all-gather.
 
-        # must not apply sequence-parallel all-gather again.
-        if getattr(self.config, "sequence_parallel", False):
-            if hasattr(self.linear_fc2, "sequence_parallel"):
-                self.linear_fc2.sequence_parallel = False
-            if hasattr(self.linear_fc2, "allreduce_dgrad"):
-                world_size = get_pg_size(tp_group)
-                disable_grad_reduce = bool(getattr(self.linear_fc2, "disable_grad_reduce", False))
-                self.linear_fc2.allreduce_dgrad = (world_size > 1) and (not disable_grad_reduce)
-            for attr in (
-                "ub_overlap_rs_fprop",
-                "ub_overlap_ag_dgrad",
-                "ub_overlap_ag_fprop",
-                "ub_overlap_rs_dgrad",
-                "ub_bulk_dgrad",
-                "ub_bulk_wgrad",
-            ):
-                if hasattr(self.linear_fc2, attr):
-                    setattr(self.linear_fc2, attr, False)
+        else:
+            # Final projection keeps the original `linear_qkv` parallel semantics.
+            self.linear_fc2 = build_module(
+                submodules.linear_fc2,
+                self.input_size,
+                self.output_size,
+                config=self.config,
+                init_method=init_method,
+                gather_output=gather_output,
+                bias=bias,
+                skip_bias_add=skip_bias_add,
+                is_expert=is_expert,
+                tp_comm_buffer_name=tp_comm_buffer_name,
+                tp_group=tp_group,
+            )
+
+            if getattr(self.config, "sequence_parallel", False):
+                self.__set_disable_sequence_parallel(self.linear_fc2)
 
         # Propagate save_original_input to inner TE modules if needed.
         if self._save_original_input:
             self.save_original_input = True
+    
+    def __set_disable_sequence_parallel(self, module: MegatronModule):
+        # must not apply sequence-parallel all-gather again.
+        if hasattr(module, "sequence_parallel"):
+            module.sequence_parallel = False
+        if hasattr(module, "allreduce_dgrad"):
+            world_size = get_pg_size(self.tp_group)
+            disable_grad_reduce = bool(getattr(module, "disable_grad_reduce", False))
+            module.allreduce_dgrad = (world_size > 1) and (not disable_grad_reduce)
+        for attr in (
+            "ub_overlap_rs_fprop",
+            "ub_overlap_ag_dgrad",
+            "ub_overlap_ag_fprop",
+            "ub_overlap_rs_dgrad",
+            "ub_bulk_dgrad",
+            "ub_bulk_wgrad",
+        ):
+            if hasattr(module, attr):
+                setattr(module, attr, False)
 
     @property
     def save_original_input(self) -> bool:
@@ -177,6 +247,8 @@ class FanQKVLinear(MegatronModule):
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Returns (output, bias) like Megatron linear layers."""
         nvtx_range_push(suffix="fan_qkv_fc1")
+
+        # [sq, b, h] --> [sq, b, (p_output_size + g_output_size)], h = p_output_size * 2 + g_output_size
         pg, _ = self.linear_fc1(hidden_states)
         # Make pg non-parallel to safely split into (p, g) on full dims.
         pg = gather_from_tensor_model_parallel_region(pg, group=self.tp_group)
@@ -191,14 +263,64 @@ class FanQKVLinear(MegatronModule):
         nvtx_range_pop(suffix="fan_qkv_activation")
 
         nvtx_range_push(suffix="fan_qkv_fc2")
-        output, output_bias = self.linear_fc2(fan_hidden)
+        if self.config.fan_enable_qk_fan:
+            # [sq, b, h] --> [sq, b, kv_channels * num_attention_heads/tp_size]
+            output_q, _ = self.linear_fc2_q(fan_hidden)
+            # [sq, b, h] --> [sq, b, kv_channels * num_query_groups/tp_size]
+            output_k, _ = self.linear_fc2_k(fan_hidden)
+            # [sq, b, h] --> [sq, b, kv_channels * num_query_groups/tp_size]
+            output_v, _ = self.linear_fc2_v(hidden_states)
+
+            # [sq, b, kv_channels * num_attention_heads/tp_size] --> [sq, b, num_query_groups/tp_size, kv_channels * num_attention_heads // tp_size // (num_query_groups/tp_size)]
+            output_q = output_q.view(
+                output_q.size(0),
+                output_q.size(1),
+                self.num_query_groups_per_partition,
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition * self.hidden_size_per_attention_head
+            )
+
+            # [sq, b, kv_channels * num_query_groups/tp_size] --> [sq, b, num_query_groups/tp_size, kv_channels]
+            output_k = output_k.view(
+                output_k.size(0),
+                output_k.size(1),
+                self.num_query_groups_per_partition,
+                self.hidden_size_per_attention_head
+            )
+
+            # [sq, b, kv_channels * num_query_groups/tp_size] --> [sq, b, num_query_groups/tp_size, kv_channels]
+            output_v = output_v.view(
+                output_v.size(0),
+                output_v.size(1),
+                self.num_query_groups_per_partition,
+                self.hidden_size_per_attention_head
+            )
+            
+            # [sq, b, num_query_groups/tp_size, (num_attention_heads/tp_size // num_query_groups/tp_size + 2) * kv_channels]
+            output = torch.cat((output_q, output_k, output_v), dim=-1)
+
+            output = output.view(
+                output.size(0),
+                output.size(1),
+                self.num_query_groups_per_partition * \
+                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2) * \
+                self.hidden_size_per_attention_head
+            )
+            output_bias = None
+
+        else:
+            # [sq, b, h] --> [sq, b, num_query_groups * (np/num_query_groups + 2) * kv_channels)]
+            output, output_bias = self.linear_fc2(fan_hidden)
         nvtx_range_pop(suffix="fan_qkv_fc2")
 
         return output, output_bias
 
     def backward_dw(self):
-        if hasattr(self.linear_fc2, "backward_dw"):
+        if self.linear_fc2 is not None and hasattr(self.linear_fc2, "backward_dw"):
             self.linear_fc2.backward_dw()
+        if self.linear_fc2_k is not None and hasattr(self.linear_fc2_k, "backward_dw"):
+            self.linear_fc2_k.backward_dw()
+        if self.linear_fc2_v is not None and hasattr(self.linear_fc2_v, "backward_dw"):
+            self.linear_fc2_v.backward_dw()
         if hasattr(self.linear_fc1, "backward_dw"):
             self.linear_fc1.backward_dw()
 
