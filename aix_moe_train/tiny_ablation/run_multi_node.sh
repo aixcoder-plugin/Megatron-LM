@@ -44,17 +44,17 @@ done
 # -----------------------------
 
 # 节点列表：支持 "ip:rank" 或 "ip"（不写 rank 时按顺序自动分配 0..N-1）
-SERVERS="${SERVERS:-"10.103.255.6:0 10.103.255.7:1"}"
+SERVERS="${SERVERS:-"10.103.255.4:0 10.103.255.1:1"}"
 
 # Docker 镜像 / 容器工作目录
 IMAGE_NAME="${IMAGE_NAME:-"nvcr.io/nvidia/pytorch:25.04-py3-megatron-260115"}"
 WORKDIR="${WORKDIR:-"/nfs100/jiangsiyuan/Megatron-LM"}"
 
 # 容器名前缀：每个节点会追加 -r${NODE_RANK}
-CONTAINER_NAME_PREFIX="${CONTAINER_NAME_PREFIX:-"megatron_4b_moe_baseline"}"
+CONTAINER_NAME_PREFIX="${CONTAINER_NAME_PREFIX:-"megatron_4b_moe_with_fan_p0"}"
 
 # 训练脚本（容器内路径，默认相对 WORKDIR）
-TRAIN_SCRIPT_REL="${TRAIN_SCRIPT_REL:-"aix_moe_train/train_4b_moe_full.sh"}"
+TRAIN_SCRIPT_REL="${TRAIN_SCRIPT_REL:-"aix_moe_train/tiny_ablation/train_4b_moe_full.sh"}"
 
 
 IB_IFNAME="${IB_IFNAME:-"ibp185s0"}"

@@ -10,17 +10,18 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 #export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN:-16}
 #export NCCL_P2P_NET_CHUNKSIZE=${NCCL_P2P_NET_CHUNKSIZE:-2097152}
 #export NCCL_AVOID_RECORD_STREAMS=${NCCL_AVOID_RECORD_STREAMS:-1}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 set +x
 
-ProjectPath="/models/nemotron_cc_v2_high_sample_50B/sample_100k"
+ProjectPath="/models/nemotron_cc_v2_high_sample_50B/sample_full"
 
-CHECKPOINT_PATH=${1:-"${ProjectPath}/checkpoints/4b_moe_bf16"}
-TENSORBOARD_LOGS_PATH=${2:-"${ProjectPath}/tensorboard_logs/4b_moe_bf16"}
+EXP_NAME="${EXP_NAME:-"4b_moe_bf16_baseline"}"
+CHECKPOINT_PATH=${1:-"${ProjectPath}/checkpoints/${EXP_NAME}"}
+TENSORBOARD_LOGS_PATH=${2:-"${ProjectPath}/tensorboard_logs/${EXP_NAME}"}
 TOKENIZER_ARG=${3:-"/models/Qwen3-30B-A3B"}
-DATA_ARG=${4:-"${ProjectPath}/nemotraon_ccv2_sample_100k_processed_data_text_document"}
-
-DATA_CACHE_PATH="${ProjectPath}/data_cache_4b_moe_bf16"
+DATA_ARG=${4:-"${ProjectPath}/nemotraon_ccv2_sample_full_processed_data_text_document"}
+DATA_CACHE_PATH="${CHECKPOINT_PATH}/data_cache_${EXP_NAME}"
 mkdir -p "$DATA_CACHE_PATH"
 
 
@@ -44,7 +45,7 @@ TP_SIZE=4
 CP_SIZE=1
 PP_SIZE=1
 MICRO_BATCH_SIZE=2
-GLOBAL_BATCH_SIZE=32
+GLOBAL_BATCH_SIZE=128
 NUM_LAYERS=24
 DTYPE="bf16"
 SEQ_LENGTH=8192
@@ -84,6 +85,13 @@ MODEL_ARGS=(
     --disable-bias-linear 
 )
 
+FanStack_ARGS=(
+    --log-stack-memory-to-tensorboard
+    --stack-memory-enabled
+    --stack-memory-slots 16
+    --stack-memory-num-heads 8
+    --stack-memory-dim 16
+)
 
 MOE_ARGS=(
         --moe-grouped-gemm
@@ -101,9 +109,9 @@ MOE_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
-    --train-samples 60000
-    --lr-decay-samples 40000
-    --lr-warmup-samples 2000
+    --train-samples 5088315
+    --lr-decay-samples 1600000
+    --lr-warmup-samples 6400
     --lr 0.00002
     --min-lr 0.000001
     --decoupled-lr 2.0e-5      # Specific to decoupled AdamW, ensure optimizer is compatible
@@ -157,10 +165,10 @@ DATA_ARGS_LIST+=(
 )
 
 EVAL_AND_LOGGING_ARGS=(
-    --log-interval 20
-    --eval-iters 40
-    --eval-interval 200
-    --save-interval 1000
+    --log-interval 40
+    --eval-iters 50
+    --eval-interval 1000
+    --save-interval 2000
     --log-throughput
     --profile
     --profile-step-start 4
@@ -174,7 +182,7 @@ EVAL_AND_LOGGING_ARGS=(
 )
 
 LOAD_ARGS=(
-    # --load "$CHECKPOINT_PATH"
+    --load "$CHECKPOINT_PATH"
     --no-load-optim
     --no-load-rng
 )
@@ -191,6 +199,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} \
     "$PRETRAIN_SCRIPT_PATH" \
     ${MODEL_ARGS[@]} \
     ${MOE_ARGS[@]} \
+    ${FanStack_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${DATA_ARGS_LIST[@]} \

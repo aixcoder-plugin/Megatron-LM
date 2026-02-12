@@ -83,6 +83,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     fan_qkv_enabled: bool = False,
+    normalization: Optional[str] = None,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -168,9 +169,14 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_norm = backend.layer_norm(for_qk=True)
         linear_qkv = backend.column_parallel_layer_norm_linear()
         if fan_qkv_enabled:
+            if normalization == "RMSNorm":
+                input_layernorm = backend.layer_norm(rms_norm=True, for_qk=False)
+            else:
+                input_layernorm = backend.layer_norm(rms_norm=False, for_qk=False)
             linear_qkv = ModuleSpec(
                 module=FanQKVLinear,
                 submodules=FanSubmodules(
+                    input_layernorm=input_layernorm,
                     linear_fc1=backend.column_parallel_linear(),
                     linear_fc2=backend.column_parallel_linear(),
                     activation_func=backend.activation_func() if use_te_activation_func else None,
@@ -446,6 +452,7 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
+            normalization=normalization,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -457,6 +464,7 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
+            normalization=normalization,
         )
     else:
         layer_norm_impl = LNImpl

@@ -88,10 +88,6 @@ MODEL_ARGS=(
 FanStack_ARGS=(
     --fan-layer-enabled
     --fan-p-ratio 0.25
-    --stack-memory-enabled
-    --stack-memory-slots 16
-    --stack-memory-num-heads 8
-    --stack-memory-dim 16
 )
 
 MOE_ARGS=(

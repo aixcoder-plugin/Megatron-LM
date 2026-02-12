@@ -13,7 +13,7 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     get_pg_size,
 )
-
+from megatron.core.transformer.identity_op import IdentityOp
 
 from .transformer_config import TransformerConfig
 
@@ -27,7 +27,7 @@ from megatron.core.dist_checkpointing.mapping import (
 
 @dataclass
 class FanSubmodules:
-
+    input_layernorm: Union[ModuleSpec, type] = IdentityOp
     linear_fc1: Union[ModuleSpec, type] = None
     activation_func: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
@@ -111,6 +111,13 @@ class FanQKVLinear(MegatronModule):
             submodules.linear_fc1 is not None and submodules.linear_fc2 is not None
         ), "FanQKVLinear requires `linear_fc1` and `linear_fc2` submodules."
 
+        self.input_layernorm = build_module(
+            submodules.input_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.input_size,
@@ -135,6 +142,8 @@ class FanQKVLinear(MegatronModule):
         
         if self.activation_func is not None:
             print_rank_0("WARNING: FanQKVLinear: activation_func is not None")
+
+        print_rank_0(f"FanQKVLinear: p_ratio: {self.p_ratio}, input_size: {self.input_size}, output_size: {self.output_size}, activation_func: {self.activation_func}, fan_enable_qk_fan: {self.config.fan_enable_qk_fan}, fan_use_p_bias: {self.use_p_bias}")
 
         self.linear_fc2 = None
         self.linear_fc2_q = None
@@ -246,6 +255,11 @@ class FanQKVLinear(MegatronModule):
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Returns (output, bias) like Megatron linear layers."""
+
+        nvtx_range_push(suffix="fan_qkv_input_layernorm")
+        hidden_states = self.input_layernorm(hidden_states)
+        nvtx_range_pop(suffix="fan_qkv_input_layernorm")
+
         nvtx_range_push(suffix="fan_qkv_fc1")
 
         # [sq, b, h] --> [sq, b, (p_output_size + g_output_size)], h = p_output_size * 2 + g_output_size

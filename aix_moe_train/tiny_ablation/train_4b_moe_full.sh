@@ -16,12 +16,12 @@ set +x
 
 ProjectPath="/models/nemotron_cc_v2_high_sample_50B/sample_full"
 
-CHECKPOINT_PATH=${1:-"${ProjectPath}/checkpoints/4b_moe_bf16_stack"}
-TENSORBOARD_LOGS_PATH=${2:-"${ProjectPath}/tensorboard_logs/4b_moe_bf16_stack"}
+EXP_NAME="${EXP_NAME:-"4b_moe_bf16_tiny_baseline"}"
+CHECKPOINT_PATH=${1:-"${ProjectPath}/tensorboard_logs_tiny/checkpoints/${EXP_NAME}"}
+TENSORBOARD_LOGS_PATH=${2:-"${ProjectPath}/tensorboard_logs_tiny/${EXP_NAME}"}
 TOKENIZER_ARG=${3:-"/models/Qwen3-30B-A3B"}
 DATA_ARG=${4:-"${ProjectPath}/nemotraon_ccv2_sample_full_processed_data_text_document"}
-
-DATA_CACHE_PATH="${ProjectPath}/data_cache_4b_moe_bf16_stack"
+DATA_CACHE_PATH="${ProjectPath}/tensorboard_logs_tiny/data_cache_tiny"
 mkdir -p "$DATA_CACHE_PATH"
 
 
@@ -41,12 +41,12 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters
-TP_SIZE=4
+TP_SIZE=1
 CP_SIZE=1
 PP_SIZE=1
 MICRO_BATCH_SIZE=2
 GLOBAL_BATCH_SIZE=128
-NUM_LAYERS=24
+NUM_LAYERS=6
 DTYPE="bf16"
 SEQ_LENGTH=8192
 MAX_POSITION_EMBEDDINGS=40960
@@ -86,8 +86,9 @@ MODEL_ARGS=(
 )
 
 FanStack_ARGS=(
+    --log-stack-memory-to-tensorboard
     --stack-memory-enabled
-    --stack-memory-slots 16
+    --stack-memory-slots 6
     --stack-memory-num-heads 8
     --stack-memory-dim 16
 )
@@ -96,10 +97,10 @@ MOE_ARGS=(
         --moe-grouped-gemm
         --moe-token-dispatcher-type alltoall
         --moe-router-topk 2
-        --num-experts 64
-        --expert-tensor-parallel-size 4
-        --expert-model-parallel-size 2
-        --moe-ffn-hidden-size 384
+        --num-experts 16
+        --expert-tensor-parallel-size 1
+        --expert-model-parallel-size 1
+        --moe-ffn-hidden-size 256
         --moe-router-load-balancing-type aux_loss
         --moe-aux-loss-coeff 0.001
         --moe-layer-freq "([1]*${NUM_LAYERS})"
@@ -167,7 +168,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 40
     --eval-iters 50
     --eval-interval 1000
-    --save-interval 1000
+    --save-interval 4000
     --log-throughput
     --profile
     --profile-step-start 4
