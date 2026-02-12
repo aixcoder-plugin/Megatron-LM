@@ -1805,6 +1805,185 @@ def post_training_step_callbacks(
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
 
+    # StackMemory debug logging.
+    if getattr(args, "log_stack_memory_to_tensorboard", False) and (
+        iteration % args.tensorboard_log_interval == 0
+    ):
+        writer = get_tensorboard_writer()
+        if writer:
+            _log_stack_memory_to_tensorboard(model, writer, iteration)
+
+
+def _set_stack_memory_tb_enabled(model, enabled: bool) -> None:
+    """Enable/disable StackMemory forward-time stat caching for TensorBoard."""
+    try:
+        from megatron.core.transformer.stack_memory import StackMemory  # pylint: disable=import-outside-toplevel
+    except Exception:
+        return
+
+    for model_chunk in model:
+        module = getattr(model_chunk, "module", None)
+        if module is None:
+            module = model_chunk
+
+        for m in module.modules():
+            if isinstance(m, StackMemory):
+                setattr(m, "_tb_enabled", enabled)
+
+
+def _reset_stack_memory_tb_cache(model) -> None:
+    """Reset StackMemory per-layer TensorBoard caches (if present)."""
+    try:
+        from megatron.core.transformer.stack_memory import StackMemory  # pylint: disable=import-outside-toplevel
+    except Exception:
+        return
+
+    for model_chunk in model:
+        module = getattr(model_chunk, "module", None)
+        if module is None:
+            module = model_chunk
+
+        for m in module.modules():
+            if not isinstance(m, StackMemory):
+                continue
+            reset_fn = getattr(m, "tb_reset", None)
+            if callable(reset_fn):
+                try:
+                    reset_fn()
+                except Exception:
+                    pass
+
+
+def _log_stack_memory_to_tensorboard(model, writer, iteration: int) -> None:
+    """Log StackMemory debug stats to TensorBoard.
+
+    Notes:
+    - This intentionally lives on the training side to avoid importing training globals from core.
+    - Writer can be None on most ranks; caller should guard.
+    """
+    try:
+        from megatron.core.transformer.stack_memory import StackMemory  # pylint: disable=import-outside-toplevel
+    except Exception:
+        return
+
+    # `model` is a list of model chunks (e.g., for (virtual) pipeline parallelism).
+    for chunk_idx, model_chunk in enumerate(model):
+        module = getattr(model_chunk, "module", None)
+        if module is None:
+            module = model_chunk
+
+        for name, m in module.named_modules():
+            if not isinstance(m, StackMemory):
+                continue
+
+            base = f"stack_memory/chunk{chunk_idx}"
+            if name:
+                base = f"{base}/{name}"
+
+            # Residual scaling parameter.
+            try:
+                writer.add_scalar(
+                    f"{base}/res_weight",
+                    float(m.res_weight.detach().float().item()),
+                    iteration,
+                )
+            except Exception:
+                pass
+
+            # Per-layer logging (preferred).
+            layer_gate = getattr(m, "_tb_layer_gate_slot_mean", None)
+            if isinstance(layer_gate, dict) and layer_gate:
+                layers_available = sorted(layer_gate.keys())
+
+                # Only log 3 layers: first / middle / last (1-based).
+                # Prefer global layer ids from args.num_layers when present; otherwise fall back to
+                # first/median/last available on this rank (e.g., under pipeline parallelism).
+                num_layers = None
+                try:
+                    args = get_args()
+                    num_layers = getattr(args, "num_layers", None)
+                except Exception:
+                    num_layers = None
+
+                desired_layers = None
+                if isinstance(num_layers, int) and num_layers > 0:
+                    desired_layers = [1, (num_layers + 1) // 2, num_layers]
+                if desired_layers is not None:
+                    desired_present = [l for l in desired_layers if l in layer_gate]
+                    layers_to_log = desired_present
+                else:
+                    layers_to_log = []
+
+                if not layers_to_log:
+                    # Fallback: first/median/last available on this rank.
+                    mid = layers_available[len(layers_available) // 2]
+                    layers_to_log = [layers_available[0], mid, layers_available[-1]]
+
+                # Deduplicate while preserving order.
+                seen = set()
+                layers_to_log = [l for l in layers_to_log if not (l in seen or seen.add(l))]
+
+                for layer_num in layers_to_log:
+                    slot_mean = layer_gate[layer_num].detach().float().cpu()
+                    for i, v in enumerate(slot_mean.tolist()):
+                        writer.add_scalar(
+                            f"{base}/layer_{layer_num}/gate_weights/slot_{i}_mean",
+                            float(v),
+                            iteration,
+                        )
+
+
+                    ent = getattr(m, "_tb_layer_gate_entropy_mean", {}).get(layer_num, None)
+                    if ent is not None:
+                        writer.add_scalar(
+                            f"{base}/layer_{layer_num}/gate_weights/entropy_mean",
+                            float(ent.detach().float().item()),
+                            iteration,
+                        )
+
+                    mask_mean = getattr(m, "_tb_layer_mask_slot_mean", {}).get(layer_num, None)
+                    if mask_mean is not None:
+                        mask_mean = mask_mean.detach().float().cpu()
+                        for i, v in enumerate(mask_mean.tolist()):
+                            writer.add_scalar(
+                                f"{base}/layer_{layer_num}/mask/slot_{i}_mean",
+                                float(v),
+                                iteration,
+                            )
+
+                    action_mean = getattr(m, "_tb_layer_action_mean", {}).get(layer_num, None)
+                    if action_mean is not None:
+                        action_mean = action_mean.detach().float().cpu().tolist()
+                        if len(action_mean) >= 3:
+                            writer.add_scalar(
+                                f"{base}/layer_{layer_num}/actions/push_mean",
+                                float(action_mean[0]),
+                                iteration,
+                            )
+                            writer.add_scalar(
+                                f"{base}/layer_{layer_num}/actions/pop_mean",
+                                float(action_mean[1]),
+                                iteration,
+                            )
+                            writer.add_scalar(
+                                f"{base}/layer_{layer_num}/actions/noop_mean",
+                                float(action_mean[2]),
+                                iteration,
+                            )
+
+            # Last-layer stack magnitude (RMS) per slot.
+            stack_rms = getattr(m, "_tb_last_stack_rms_slot", None)
+            last_layer = getattr(m, "_tb_last_layer_number", None)
+            if stack_rms is not None:
+                stack_rms = stack_rms.detach().float().cpu()
+                layer_tag = f"layer_{last_layer}" if last_layer is not None else "last_layer"
+                for i, v in enumerate(stack_rms.tolist()):
+                    writer.add_scalar(
+                        f"{base}/{layer_tag}/new_stack/rms_slot_{i}",
+                        float(v),
+                        iteration,
+                    )
+
 
 def checkpoint_and_decide_exit(
     model,
@@ -2020,6 +2199,8 @@ def train(
     # Turn on training mode which enables dropout.
     for model_module in model:
         model_module.train()
+
+    # StackMemory TensorBoard capture is toggled per-iteration in the main loop to limit overhead.
 
     # Tracking loss.
     total_loss_dict = {}
@@ -2245,6 +2426,16 @@ def train(
                     )
                 train_data_iterator = buffered_rollouts
 
+        # StackMemory TB capture (only on the rank that owns the TensorBoard writer).
+        # We enable capture only when this step will be logged to limit overhead.
+        if getattr(args, "log_stack_memory_to_tensorboard", False):
+            writer = get_tensorboard_writer()
+            if writer:
+                should_capture = ((iteration + 1) % args.tensorboard_log_interval == 0)
+                _set_stack_memory_tb_enabled(model, should_capture)
+                if should_capture:
+                    _reset_stack_memory_tb_cache(model)
+
         ft_integration.on_training_step_start()
         (
             loss_dict,
@@ -2258,6 +2449,13 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
         ft_integration.on_training_step_end()
+
+        # Freeze StackMemory caches so evaluation (if any) doesn't overwrite training-step stats.
+        if getattr(args, "log_stack_memory_to_tensorboard", False):
+            writer = get_tensorboard_writer()
+            if writer and ((iteration + 1) % args.tensorboard_log_interval == 0):
+                _set_stack_memory_tb_enabled(model, False)
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -85,7 +85,37 @@ class StackMemory(MegatronModule):
         # Residual scaling.
         self.res_weight = nn.Parameter(torch.ones(1))
 
+        # TensorBoard debug stats (written by training loop; core must not import training).
+        # These are updated every forward() call and can be read externally.
+        self._tb_enabled: bool = False
+        self._tb_last_layer_number: Optional[int] = None
+        self._tb_last_gate_slot_mean: Optional[Tensor] = None  # [stack_slots] fp32
+        self._tb_last_gate_entropy_mean: Optional[Tensor] = None  # [] fp32
+        self._tb_last_mask_slot_mean: Optional[Tensor] = None  # [stack_slots] fp32
+        self._tb_last_action_mean: Optional[Tensor] = None  # [3] fp32 (push, pop, noop)
+        self._tb_last_stack_rms_slot: Optional[Tensor] = None  # [stack_slots] fp32
+
+        # Per-layer caches (keyed by global layer_number, 1-based in Megatron).
+        self._tb_layer_gate_slot_mean: Dict[int, Tensor] = {}
+        self._tb_layer_gate_entropy_mean: Dict[int, Tensor] = {}
+        self._tb_layer_mask_slot_mean: Dict[int, Tensor] = {}
+        self._tb_layer_action_mean: Dict[int, Tensor] = {}
+
         self._mark_parameters_for_tp_grad_sync()
+
+    def tb_reset(self) -> None:
+        """Clear per-layer TensorBoard debug caches (called by training-side code)."""
+        self._tb_last_layer_number = None
+        self._tb_last_gate_slot_mean = None
+        self._tb_last_gate_entropy_mean = None
+        self._tb_last_mask_slot_mean = None
+        self._tb_last_action_mean = None
+        self._tb_last_stack_rms_slot = None
+
+        self._tb_layer_gate_slot_mean.clear()
+        self._tb_layer_gate_entropy_mean.clear()
+        self._tb_layer_mask_slot_mean.clear()
+        self._tb_layer_action_mean.clear()
 
     def _mark_parameters_for_tp_grad_sync(self) -> None:
         """因为参数太小没用张量并行，所以要在不同的TP rank上复制一份权重，并保持更新同步"""
@@ -155,6 +185,8 @@ class StackMemory(MegatronModule):
         pop_w_mask = pop_w.unsqueeze(-1)
         noop_w_mask = noop_w.unsqueeze(-1)
 
+        # new_mask = (masks * action_weights.squeeze(-1)).sum(dim=3)
+        # action_weights is distribution of probabilities over slots, so new_mask is soft probabilities of occupied slots.
         new_mask = push_w_mask * push_mask + pop_w_mask * pop_mask + noop_w_mask * mask
         return new_stack, new_mask
 
@@ -163,6 +195,8 @@ class StackMemory(MegatronModule):
         hidden_states: Tensor,
         memory_stack: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
+        layer_number: Optional[int] = None,
+        is_last_layer: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Forward pass.
 
@@ -178,12 +212,13 @@ class StackMemory(MegatronModule):
 
         action_logits = self.action_head(hidden_states) / math.sqrt(self.head_dim)
 
-        # float32 for stability; 
-        actions = torch.softmax(
+        # float32 for stability;
+        actions_fp32 = torch.softmax(
             action_logits.reshape(seq_len, batch_size, self.num_mem_heads, 3),
             dim=-1,
             dtype=torch.float32,
-        ).to(dtype=hidden_states.dtype)
+        )
+        actions = actions_fp32.to(dtype=hidden_states.dtype)
 
         # TODO: splited chunks should be compatible with MultiheadAttention?
         k_values = hidden_states.reshape(seq_len, batch_size, self.num_mem_heads, self.head_dim)
@@ -196,10 +231,49 @@ class StackMemory(MegatronModule):
         ) # [s, b, hds, slots, dim], [s, b, hds, slots]
 
         gate_scores = self.gate_proj(new_stack).squeeze(-1)  # [s,b,hds,slots]
-        gate_logits = gate_scores.float() + (1.0 - new_mask) * (-1.0e9)
-        gate_weights = torch.softmax(gate_logits, dim=-1, dtype=torch.float32).to(
-            dtype=new_stack.dtype
-        )
+        # gate_logits = gate_scores.float() + (1.0 - new_mask) * (-1.0e9)
+
+        # new_mask is a continuous probability (occupancy in [0,1]), so using (1-mask)*(-1e9) as a hard mask is not appropriate.
+        # Otherwise, softmax will directly saturate to argmax(mask) (usually slot 0), causing gate_weights to become one-hot.
+        # Here, the mask is treated as a prior: w ∝ exp(score) * mask  <=>  logits = score + log(mask)
+        
+        gate_logits = gate_scores.float() + torch.log(new_mask.float().clamp_min(1e-9))
+
+        gate_weights_fp32 = torch.softmax(gate_logits, dim=-1, dtype=torch.float32)  # [s,b,hds,slots]
+        gate_weights = gate_weights_fp32.to(dtype=new_stack.dtype)
+
+        # Cache a few cheap-to-log stats for TensorBoard (no graph refs).
+        # Note: do not .item() here to avoid per-forward GPU sync; training loop can convert.
+        if self._tb_enabled:
+            with torch.no_grad():
+                layer_key = int(layer_number) if layer_number is not None else None
+                self._tb_last_layer_number = layer_key
+
+                # Mean gate weight per slot over (seq, batch, heads): [slots]
+                gate_slot_mean = gate_weights_fp32.mean(dim=(0, 1, 2))
+                self._tb_last_gate_slot_mean = gate_slot_mean
+
+                # entropy (peakiness diagnostics).
+                p = gate_weights_fp32.clamp_min(1.0e-9)
+                self._tb_last_gate_entropy_mean = (-p * torch.log(p)).sum(dim=-1).mean()
+
+                # Mask slot mean and action mean (push/pop/noop).
+                self._tb_last_mask_slot_mean = new_mask.mean(dim=(0, 1, 2))
+                self._tb_last_action_mean = actions_fp32.mean(dim=(0, 1, 2))  # [3]
+
+                # Optionally compute last-layer stack RMS per slot (lightweight magnitude check).
+                if is_last_layer:
+                    n = float(seq_len * batch_size * self.num_mem_heads * self.stack_dim)
+                    # L2 norm over (seq, batch, heads, dim) leaving slots dimension.
+                    l2 = torch.linalg.vector_norm(new_stack, ord=2, dim=(0, 1, 2, 4))
+                    self._tb_last_stack_rms_slot = l2 / math.sqrt(n)
+
+                # Store per-layer snapshots.
+                if layer_key is not None:
+                    self._tb_layer_gate_slot_mean[layer_key] = gate_slot_mean
+                    self._tb_layer_gate_entropy_mean[layer_key] = self._tb_last_gate_entropy_mean
+                    self._tb_layer_mask_slot_mean[layer_key] = self._tb_last_mask_slot_mean
+                    self._tb_layer_action_mean[layer_key] = self._tb_last_action_mean
 
         # Aggregate memory output: sum over slots.
         memory_output = (new_stack * gate_weights.unsqueeze(-1)).sum(dim=-2)  # [s,b,hds,dim]

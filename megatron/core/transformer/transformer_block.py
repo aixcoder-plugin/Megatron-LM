@@ -686,7 +686,11 @@ class TransformerBlock(MegatronModule):
 
                         if self.stack_memory is not None and stack_memory_state is not None:
                             hidden_states, stack_memory_state.stack, stack_memory_state.mask = self.stack_memory(
-                                hidden_states, stack_memory_state.stack, stack_memory_state.mask
+                                hidden_states,
+                                stack_memory_state.stack,
+                                stack_memory_state.mask,
+                                layer_number=getattr(layer, "layer_number", None),
+                                is_last_layer=(l_no == (len(self.layers) - 1)),
                             )
                             # print_rank_0("layer {}: stack_memory_state.stack.shape: {}".format(l_no, stack_memory_state.stack.shape))
 

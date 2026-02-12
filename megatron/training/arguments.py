@@ -1663,6 +1663,12 @@ def _add_stack_memory_args(parser):
         help='Stack dimension per head. If 0, defaults to head_dim (hidden_size / num_heads).',
         dest='stack_memory_dim',
     )
+    group.add_argument(
+        '--log-stack-memory-to-tensorboard',
+        action='store_true',
+        help='Log StackMemory gate weights (slot mean / top1 / entropy) and res_weight to TensorBoard.',
+        dest='log_stack_memory_to_tensorboard',
+    )
 
     return parser
 
