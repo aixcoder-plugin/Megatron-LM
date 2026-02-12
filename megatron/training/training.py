@@ -135,6 +135,71 @@ stimer = StragglerDetector()
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 
+def _visualize_model_structure(model, args):
+    """Print model structure tree and optionally generate a Graphviz SVG diagram.
+
+    Only executed on rank 0. The function:
+      1. Prints the PyTorch module tree (text) to stdout.
+      2. Generates a Graphviz SVG if the ``graphviz`` package is installed.
+
+    Args:
+        model: list of model chunks returned by ``setup_model_and_optimizer``.
+        args: global arguments namespace.
+    """
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+
+    unwrapped = unwrap_model(model)
+    for idx, m in enumerate(unwrapped):
+        header = f"===== Model Chunk {idx} =====" if len(unwrapped) > 1 else "===== Model Structure ====="
+        print(f"\n{header}", flush=True)
+        print(m, flush=True)
+
+    # ---------- Graphviz SVG ----------
+    try:
+        from graphviz import Digraph  # noqa: F811
+    except ImportError:
+        print(
+            "[visualize-model-structure] graphviz not installed, "
+            "skipping SVG generation. Run `pip install graphviz` to enable.",
+            flush=True,
+        )
+        return
+
+    save_dir = getattr(args, "save", None) or "."
+    os.makedirs(save_dir, exist_ok=True)
+
+    for idx, m in enumerate(unwrapped):
+        suffix = f"_chunk{idx}" if len(unwrapped) > 1 else ""
+        out_path = os.path.join(save_dir, f"model_structure{suffix}")
+
+        dot = Digraph("model", node_attr={"shape": "box", "style": "rounded"})
+        dot.attr(rankdir="TB", fontsize="10")
+        dot.node("root", f"{m.__class__.__name__}")
+
+        def _visit(mod, parent_id, depth, max_depth=8):
+            if depth >= max_depth:
+                return
+            for name, child in mod.named_children():
+                child_id = f"{parent_id}.{name}"
+                label = f"{name}\n{child.__class__.__name__}"
+                dot.node(child_id, label)
+                dot.edge(parent_id, child_id)
+                _visit(child, child_id, depth + 1, max_depth)
+
+        _visit(m, "root", 0)
+        try:
+            dot.render(out_path, format="svg", cleanup=True)
+            print(f"[visualize-model-structure] saved: {out_path}.svg", flush=True)
+        except Exception as e:
+            print(
+                f"[visualize-model-structure] SVG rendering failed: {e}\n"
+                "Hint: install the system Graphviz package "
+                "(e.g. `apt install graphviz` or `conda install graphviz`).",
+                flush=True,
+            )
+
+
 def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -664,6 +729,11 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+
+    # Optionally visualize model structure (text + SVG).
+    if getattr(args, 'visualize_model_structure', False):
+        _visualize_model_structure(model, args)
+
     config = get_model_config(model[0])
 
     # Data stuff.

@@ -718,6 +718,12 @@ class TransformerConfig(ModelParallelConfig):
 
     fan_enable_qk_fan: bool = True
     """Whether to enable qk for FAN fc1 projection (shared for p and g parts)."""
+    
+    fan_layer_no_norm_enabled: bool = False
+    """Whether to disable FAN layer normalization."""
+
+    fan_pre_mlp_norm_enabled: bool = False
+    """Whether to replace pre_mlp_layernorm (RMSNorm) with a FAN-based transformation (FanNorm)."""
 
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""

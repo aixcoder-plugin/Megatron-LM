@@ -303,6 +303,9 @@ class TransformerBlock(MegatronModule):
             from megatron.core.transformer.stack_memory import StackMemory
 
             self.stack_memory = StackMemory(self.config)
+        
+        if getattr(self.config, "fan_pre_mlp_norm_enabled", False):
+            post_layer_norm = False
 
         self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
         self.post_layer_norm = post_layer_norm

@@ -5,7 +5,10 @@ from typing import NoReturn, Optional, Tuple, Union
 import torch
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.utils import (
     divide,
     nvtx_range_pop,
@@ -143,7 +146,7 @@ class FanQKVLinear(MegatronModule):
         if self.activation_func is not None:
             print_rank_0("WARNING: FanQKVLinear: activation_func is not None")
 
-        print_rank_0(f"FanQKVLinear: p_ratio: {self.p_ratio}, input_size: {self.input_size}, output_size: {self.output_size}, activation_func: {self.activation_func}, fan_enable_qk_fan: {self.config.fan_enable_qk_fan}, fan_use_p_bias: {self.use_p_bias}")
+        print_rank_0(f"FanLinear: p_ratio: {self.p_ratio}, fused_dims: {self.fused_dims}, input_size: {self.input_size}, output_size: {self.output_size}, activation_func: {self.activation_func}, fan_enable_qk_fan: {self.config.fan_enable_qk_fan}, fan_use_p_bias: {self.use_p_bias}, input_layernorm: {self.input_layernorm}")
 
         self.linear_fc2 = None
         self.linear_fc2_q = None
@@ -253,28 +256,36 @@ class FanQKVLinear(MegatronModule):
             if m is not None and hasattr(m, "save_original_input"):
                 m.save_original_input = bool(value)
 
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-        """Returns (output, bias) like Megatron linear layers."""
+    def _fan_transform(self, hidden_states: torch.Tensor):
+        """Core FAN feature transform shared by QKV and Norm paths.
 
-        nvtx_range_push(suffix="fan_qkv_input_layernorm")
+        Returns:
+            hidden_states: the (possibly layernorm'd) input, needed by V projection.
+            fan_hidden: [cos(p), sin(p), g] features, same hidden size as input.
+        """
+        nvtx_range_push(suffix="fan_input_layernorm")
         hidden_states = self.input_layernorm(hidden_states)
-        nvtx_range_pop(suffix="fan_qkv_input_layernorm")
+        nvtx_range_pop(suffix="fan_input_layernorm")
 
-        nvtx_range_push(suffix="fan_qkv_fc1")
-
+        nvtx_range_push(suffix="fan_fc1")
         # [sq, b, h] --> [sq, b, (p_output_size + g_output_size)], h = p_output_size * 2 + g_output_size
         pg, _ = self.linear_fc1(hidden_states)
-        # Make pg non-parallel to safely split into (p, g) on full dims.
         pg = gather_from_tensor_model_parallel_region(pg, group=self.tp_group)
-        nvtx_range_pop(suffix="fan_qkv_fc1")
+        nvtx_range_pop(suffix="fan_fc1")
 
-        nvtx_range_push(suffix="fan_qkv_activation")
+        nvtx_range_push(suffix="fan_activation")
         p, g = pg.split(self.fused_dims, dim=-1)
         if self.activation_func is not None:
             fan_hidden = torch.cat((torch.cos(p), torch.sin(p), self.activation_func(g)), dim=-1)
         else:
             fan_hidden = torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)
-        nvtx_range_pop(suffix="fan_qkv_activation")
+        nvtx_range_pop(suffix="fan_activation")
+
+        return hidden_states, fan_hidden
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        """Returns (output, bias) like Megatron linear layers."""
+        hidden_states, fan_hidden = self._fan_transform(hidden_states)
 
         nvtx_range_push(suffix="fan_qkv_fc2")
         if self.config.fan_enable_qk_fan:
@@ -339,121 +350,54 @@ class FanQKVLinear(MegatronModule):
             self.linear_fc1.backward_dw()
 
 
-class FanLinear(MegatronModule):
-    """
+class FanLayer(FanQKVLinear):
+    """Thin adapter over :class:`FanQKVLinear` for the ``pre_mlp_layernorm`` position.
 
-    We use the following notation:
-     h: hidden size
-     p: number of tensor model parallel partitions
-     b: batch size
-     s: sequence length
+    Reuses the core FAN logic (:meth:`_fan_transform`) from the parent class.
+
+    Interface differences vs ``FanQKVLinear``:
+    1. ``__init__`` accepts ``(config, hidden_size, eps)`` -- the signature that
+       ``build_module`` uses for layer-norm modules.
+    2. Always builds a single ``linear_fc2`` (hidden -> hidden), no Q/K/V split.
+    3. ``forward()`` returns a **single tensor** (not ``(output, bias)``).
     """
 
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: FanSubmodules,
-        input_size: Optional[int] = None,
-        output_size: Optional[int] = None,
+        hidden_size: int,
+        eps: float = 1e-5,  # kept for interface compat, unused
+        *,
+        submodules: Optional[FanSubmodules] = None,
         p_ratio: Optional[float] = None,
         use_p_bias: Optional[bool] = None,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        **kwargs,
     ):
-        super().__init__(config=config)
-
-        self.config: TransformerConfig = config
-
-        self.input_size = input_size if input_size is not None else self.config.hidden_size
-        self.output_size = output_size if output_size is not None else self.config.hidden_size
-        self.p_ratio = (
-            p_ratio if p_ratio is not None else getattr(self.config, "fan_p_ratio", 0.25)
-        )
-        self.use_p_bias = (
-            use_p_bias
-            if use_p_bias is not None
-            else getattr(self.config, "fan_use_p_bias", True)
-        )
-
-        # Ensure the p_ratio is within a valid range
-        assert 0 <= self.p_ratio <= 0.5, "p_ratio must be between 0 and 0.5"
-
-        p_output_size = int(self.input_size * self.p_ratio)
-        g_output_size = self.input_size - p_output_size * 2  # Account for cosine and sine terms
-
-        self.fused_dims = (p_output_size, g_output_size)
-
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=False)
-
-
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
-            self.input_size,
-            p_output_size + g_output_size,
-            config=self.config,
-            init_method=self.config.init_method,
-            # TODO: fc1的输出虽然存在一系列的操作，但都是元素级的，理论上能在fc2算完之后再通信聚合，但是后续对hidden_size 维度做split，
-            # 这个和 ColumnParallelLinear 的维度一致，所以存在冲突，需要额外增加一层聚合的通信，这个能通过mask优化解决
-            gather_output=True,
-            bias=self.use_p_bias,
-            # TODO: 需要确认，全连接层的bias后续只有部分过激活函数，bias不能和后续的激活函数做算子融合
+        super().__init__(
+            input_size=hidden_size,
+            output_size=hidden_size,
+            config=config,
+            init_method=config.init_method,
+            bias=config.add_bias_linear,
+            gather_output=False,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name="fc1",
-            tp_group=tp_group,
+            tp_comm_buffer_name="fan_norm",
+            submodules=submodules,
+            p_ratio=p_ratio,
+            use_p_bias=use_p_bias,
         )
+        self.linear_fc2_q = None
+        self.linear_fc2_k = None
+        self.linear_fc2_v = None
+        self.linear_fc2 = IdentityOp()
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
-        else:
-            self.activation_func = self.config.activation_func
-
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.input_size,
-            self.output_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            # Fan fc2 uses ColumnParallelLinear to stay compatible with sequence_parallel.
-            gather_output=True,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="fc2",
-            tp_group=tp_group,
-        )
-
-    def forward(self, hidden_states, per_token_scale=None):
-        """Perform the forward pass through the fan block."""
-        # [s, b, h] => [s, b, (p_output_size + g_output_size)/p]
-        nvtx_range_push(suffix="linear_fc1")
-        intermediate_non_parallel, _ = self.linear_fc1(hidden_states)
-        nvtx_range_pop(suffix="linear_fc1")
-
-        nvtx_range_push(suffix="activation")
-        p, g = intermediate_non_parallel.split(self.fused_dims, dim=-1)
-        intermediate_non_parallel = torch.cat((torch.cos(p), torch.sin(p), self.activation_func(g)), dim=-1)
-        nvtx_range_pop(suffix="activation")
-
-        # [s, b, h]
-        nvtx_range_push(suffix="linear_fc2")
-        output, _ = self.linear_fc2(intermediate_non_parallel)
-        nvtx_range_pop(suffix="linear_fc2")
-
-        return output, None
-
-    # pylint: disable=missing-function-docstring
-    def sharded_state_dict(
-        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
-    ) -> ShardedStateDict:
-        """Return the sharded state dictionary of the module."""
-        sharded_state_dict = {}
-        for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
-            sharded_state_dict.update(sub_sd)
-        return sharded_state_dict
-
-    def backward_dw(self):
-        self.linear_fc2.backward_dw()
-        self.linear_fc1.backward_dw()
-
+    def forward(self, hidden_states, **kwargs):
+        """Return a single tensor, matching the layernorm interface."""
+        _, fan_hidden = self._fan_transform(hidden_states)
+        # fc1 (SP) does all-gather on seq dim: (seq/tp, b, h) -> (seq, b, ...).
+        # Scatter back so the output shape matches the SP-sharded residual.
+        if getattr(self.config, "sequence_parallel", False):
+            fan_hidden = scatter_to_sequence_parallel_region(fan_hidden)
+        return fan_hidden
 

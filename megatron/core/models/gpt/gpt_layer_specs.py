@@ -10,7 +10,7 @@ from megatron.core.utils import is_te_min_version
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.fan_layer import FanQKVLinear, FanSubmodules
+from megatron.core.transformer.fan_layer import FanQKVLinear, FanLayer, FanSubmodules
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
@@ -83,6 +83,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     fan_qkv_enabled: bool = False,
+    fan_layer_no_norm_enabled: bool = False,
+    fan_pre_mlp_norm_enabled: bool = False,
     normalization: Optional[str] = None,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
@@ -128,6 +130,21 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_activation_func=use_te_activation_func,
     )
 
+    # Determine pre_mlp_layernorm spec: FanLayer when enabled, else original layernorm/IdentityOp.
+    if fan_pre_mlp_norm_enabled and num_experts:
+        pre_mlp_layernorm = ModuleSpec(
+            module=FanLayer,
+            submodules=FanSubmodules(
+                linear_fc1=backend.column_parallel_linear(),
+                linear_fc2=backend.column_parallel_linear(),
+                activation_func=None,
+            ),
+        )
+    elif num_experts:
+        pre_mlp_layernorm = backend.layer_norm()
+    else:
+        pre_mlp_layernorm = IdentityOp
+
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         linear_q_up_proj = (
@@ -160,7 +177,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                pre_mlp_layernorm=pre_mlp_layernorm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
             ),
@@ -169,10 +186,13 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_norm = backend.layer_norm(for_qk=True)
         linear_qkv = backend.column_parallel_layer_norm_linear()
         if fan_qkv_enabled:
-            if normalization == "RMSNorm":
+            if fan_layer_no_norm_enabled:
+                input_layernorm = IdentityOp
+            elif normalization == "RMSNorm":
                 input_layernorm = backend.layer_norm(rms_norm=True, for_qk=False)
             else:
                 input_layernorm = backend.layer_norm(rms_norm=False, for_qk=False)
+                
             linear_qkv = ModuleSpec(
                 module=FanQKVLinear,
                 submodules=FanSubmodules(
@@ -201,7 +221,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                pre_mlp_layernorm=pre_mlp_layernorm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map={
@@ -227,6 +247,8 @@ def get_gpt_layer_local_spec(
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
     fan_qkv_enabled: bool = False,
+    fan_layer_no_norm_enabled: bool = False,
+    fan_pre_mlp_norm_enabled: bool = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -256,6 +278,22 @@ def get_gpt_layer_local_spec(
     else:
         layer_norm = backend.layer_norm(rms_norm=False, for_qk=False)
         qk_norm = backend.layer_norm(rms_norm=False, for_qk=True)
+    
+    if fan_layer_no_norm_enabled:
+        input_layernorm = IdentityOp
+    else:
+        input_layernorm = layer_norm
+
+    if fan_pre_mlp_norm_enabled:
+        pre_mlp_layernorm = ModuleSpec(
+            module=FanLayer,
+            submodules=FanSubmodules(
+                linear_fc1=backend.column_parallel_linear(),
+                linear_fc2=backend.column_parallel_linear(),
+            ),
+        )
+    else:
+        pre_mlp_layernorm = layer_norm
 
     if fp8 is not None:
         warnings.warn(
@@ -301,7 +339,7 @@ def get_gpt_layer_local_spec(
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=layer_norm,
+                input_layernorm=input_layernorm,
                 self_attention=ModuleSpec(
                     module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -310,6 +348,7 @@ def get_gpt_layer_local_spec(
                             ModuleSpec(
                                 module=FanQKVLinear,
                                 submodules=FanSubmodules(
+                                    input_layernorm=IdentityOp,
                                     linear_fc1=backend.column_parallel_linear(),
                                     linear_fc2=backend.column_parallel_linear(),
                                 ),
@@ -328,7 +367,7 @@ def get_gpt_layer_local_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=layer_norm,
+                pre_mlp_layernorm=pre_mlp_layernorm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map={
@@ -452,6 +491,8 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
+            fan_layer_no_norm_enabled=getattr(config, "fan_layer_no_norm_enabled", False),
+            fan_pre_mlp_norm_enabled=getattr(config, "fan_pre_mlp_norm_enabled", False),
             normalization=normalization,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -464,6 +505,8 @@ def get_gpt_decoder_block_spec(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
+            fan_layer_no_norm_enabled=getattr(config, "fan_layer_no_norm_enabled", False),
+            fan_pre_mlp_norm_enabled=getattr(config, "fan_pre_mlp_norm_enabled", False),
             normalization=normalization,
         )
     else:
@@ -478,6 +521,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
+            fan_pre_mlp_norm_enabled=getattr(config, "fan_pre_mlp_norm_enabled", False),
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -489,6 +533,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             fan_qkv_enabled=getattr(config, "fan_qkv_enabled", False),
+            fan_pre_mlp_norm_enabled=getattr(config, "fan_pre_mlp_norm_enabled", False),
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

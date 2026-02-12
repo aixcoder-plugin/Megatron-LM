@@ -1703,6 +1703,19 @@ def _add_fan_layer_args(parser):
         help='Disable qk for FAN fc1 projection (shared for p and g parts).',
         dest='fan_enable_qk_fan',
     )
+    group.add_argument(
+        '--fan-layer-no-norm-enabled',
+        action='store_true',
+        help='Disable FAN layer normalization.',
+        dest='fan_layer_no_norm_enabled',
+    )
+    group.add_argument(
+        '--fan-pre-mlp-norm-enabled',
+        action='store_true',
+        help='Replace the pre-MLP layernorm (RMSNorm) with a FAN-based '
+             'transformation module (FanNorm).',
+        dest='fan_pre_mlp_norm_enabled',
+    )
     group.set_defaults(fan_use_p_bias=True)
 
     return parser
@@ -1899,6 +1912,12 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
+    group.add_argument('--visualize-model-structure', action='store_true',
+                       help='If set, print the model module tree (text) and '
+                       'generate a Graphviz SVG diagram after model '
+                       'initialization. The SVG is saved to the checkpoint '
+                       'save directory (--save) or the current working '
+                       'directory. Only executed on rank 0.')
     return parser
 
 
