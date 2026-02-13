@@ -581,9 +581,25 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
+    # Determine final_layernorm spec: FanLayer when fan_pre_mlp_norm_enabled, else normal norm.
+    if getattr(config, "fan_pre_mlp_norm_enabled", False):
+        if use_transformer_engine:
+            fan_backend = TESpecProvider()
+        else:
+            fan_backend = LocalSpecProvider()
+        final_layer_norm = ModuleSpec(
+            module=FanLayer,
+            submodules=FanSubmodules(
+                linear_fc1=fan_backend.column_parallel_linear(),
+                linear_fc2=fan_backend.column_parallel_linear(),
+            ),
+        )
+    else:
+        final_layer_norm = layer_norm_impl
+
     # Block spec.
     block_spec = TransformerBlockSubmodules(
-        layer_specs=local_layer_specs, layer_norm=layer_norm_impl
+        layer_specs=local_layer_specs, layer_norm=final_layer_norm
     )
 
     return block_spec
