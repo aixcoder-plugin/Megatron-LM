@@ -1716,6 +1716,13 @@ def _add_fan_layer_args(parser):
              'transformation module (FanNorm).',
         dest='fan_pre_mlp_norm_enabled',
     )
+    group.add_argument(
+        '--fan-no-compress',
+        action='store_true',
+        help='Skip FAN fc1 compression; apply sin/cos directly on hidden '
+             'states, then fc2 compresses 2*hidden_size to the target output.',
+        dest='fan_no_compress',
+    )
     group.set_defaults(fan_use_p_bias=True)
 
     return parser

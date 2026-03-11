@@ -92,9 +92,15 @@ class FanQKVLinear(MegatronModule):
 
         assert 0.0 <= self.p_ratio <= 0.5, "p_ratio must be between 0 and 0.5"
 
+        self.fan_no_compress = getattr(self.config, "fan_no_compress", False)
+
+
         p_output_size = int(self.input_size * self.p_ratio)
         g_output_size = self.input_size - p_output_size * 2
         self.fused_dims = (p_output_size, g_output_size)
+
+        if self.fan_no_compress:
+            assert p_output_size == self.input_size // 2, "p_ratio must be 0.5 for fan_no_compress"
 
         # We gather the intermediate so we can split on full (p, g) dims safely.
         fc1_out_size = p_output_size + g_output_size  # = input_size - p_output_size
@@ -121,21 +127,28 @@ class FanQKVLinear(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
-            self.input_size,
-            fc1_out_size,
-            config=self.config,
-            init_method=init_method,
-            gather_output=False,
-            bias=self.use_p_bias,
-            skip_bias_add=False,
-            is_expert=is_expert,
-            tp_comm_buffer_name=(
-                f"{tp_comm_buffer_name}_fan_fc1" if tp_comm_buffer_name else "fan_qkv_fc1"
-            ),
-            tp_group=tp_group,
-        )
+        if self.fan_no_compress:
+            # No fc1 compression; sin/cos applied directly on hidden_states.
+            # fc2 input dimension doubles (cos + sin).
+            self.linear_fc1 = None
+            fc2_input_size = 2 * self.input_size
+        else:
+            fc2_input_size = self.input_size
+            self.linear_fc1 = build_module(
+                submodules.linear_fc1,
+                self.input_size,
+                fc1_out_size,
+                config=self.config,
+                init_method=init_method,
+                gather_output=False,
+                bias=self.use_p_bias,
+                skip_bias_add=False,
+                is_expert=is_expert,
+                tp_comm_buffer_name=(
+                    f"{tp_comm_buffer_name}_fan_fc1" if tp_comm_buffer_name else "fan_qkv_fc1"
+                ),
+                tp_group=tp_group,
+            )
 
         self.activation_func = None
         if self.config.use_te_activation_func and submodules.activation_func is not None:
@@ -146,7 +159,7 @@ class FanQKVLinear(MegatronModule):
         if self.activation_func is not None:
             print_rank_0("WARNING: FanQKVLinear: activation_func is not None")
 
-        print_rank_0(f"FanLinear: p_ratio: {self.p_ratio}, fused_dims: {self.fused_dims}, input_size: {self.input_size}, output_size: {self.output_size}, activation_func: {self.activation_func}, fan_enable_qk_fan: {self.config.fan_enable_qk_fan}, fan_use_p_bias: {self.use_p_bias}, input_layernorm: {self.input_layernorm}")
+        print_rank_0(f"FanLinear: p_ratio: {self.p_ratio}, fused_dims: {self.fused_dims}, input_size: {self.input_size}, output_size: {self.output_size}, activation_func: {self.activation_func}, fan_enable_qk_fan: {self.config.fan_enable_qk_fan}, fan_use_p_bias: {self.use_p_bias}, input_layernorm: {self.input_layernorm}, fan_no_compress: {self.fan_no_compress}")
 
         self.linear_fc2 = None
         self.linear_fc2_q = None
@@ -156,7 +169,7 @@ class FanQKVLinear(MegatronModule):
             assert skip_bias_add is False, "skip_bias_add must be False for FAN-QKV"
             self.linear_fc2_q = build_module(
                 submodules.linear_fc2,
-                self.input_size,
+                fc2_input_size,
                 self.query_projection_size,
                 config=self.config,
                 init_method=init_method,
@@ -169,7 +182,7 @@ class FanQKVLinear(MegatronModule):
             )
             self.linear_fc2_k = build_module(
                 submodules.linear_fc2,
-                self.input_size,
+                fc2_input_size,
                 self.kv_projection_size,
                 config=self.config,
                 init_method=init_method,
@@ -194,7 +207,7 @@ class FanQKVLinear(MegatronModule):
                 tp_group=tp_group,
             )
 
-            if getattr(self.config, "sequence_parallel", False):
+            if getattr(self.config, "sequence_parallel", False) and not self.fan_no_compress:
                 self.__set_disable_sequence_parallel(self.linear_fc2_q)
                 self.__set_disable_sequence_parallel(self.linear_fc2_k)
                 # NOTE: Keep sequence-parallel semantics for V.
@@ -202,12 +215,14 @@ class FanQKVLinear(MegatronModule):
                 #   so we must disable SP to avoid gathering again.
                 # - V consumes the original `hidden_states`, which may still be sequence-parallel
                 #   (sharded along dim0), so we keep SP enabled on linear_fc2_v to all-gather.
+                # When fan_no_compress is True, fan_hidden is still SP-sharded (no fc1 all-gather),
+                # so Q/K also need SP to all-gather the seq dim.
 
         else:
             # Final projection keeps the original `linear_qkv` parallel semantics.
             self.linear_fc2 = build_module(
                 submodules.linear_fc2,
-                self.input_size,
+                fc2_input_size,
                 self.output_size,
                 config=self.config,
                 init_method=init_method,
@@ -219,7 +234,7 @@ class FanQKVLinear(MegatronModule):
                 tp_group=tp_group,
             )
 
-            if getattr(self.config, "sequence_parallel", False):
+            if getattr(self.config, "sequence_parallel", False) and not self.fan_no_compress:
                 self.__set_disable_sequence_parallel(self.linear_fc2)
 
         # Propagate save_original_input to inner TE modules if needed.
@@ -261,25 +276,36 @@ class FanQKVLinear(MegatronModule):
 
         Returns:
             hidden_states: the (possibly layernorm'd) input, needed by V projection.
-            fan_hidden: [cos(p), sin(p), g] features, same hidden size as input.
+            fan_hidden: FAN features.
+                - compress mode: [cos(p), sin(p), g], same hidden size as input.
+                - no-compress mode: [cos(h), sin(h)], 2× hidden size.
         """
         nvtx_range_push(suffix="fan_input_layernorm")
         hidden_states = self.input_layernorm(hidden_states)
         nvtx_range_pop(suffix="fan_input_layernorm")
 
-        nvtx_range_push(suffix="fan_fc1")
-        # [sq, b, h] --> [sq, b, (p_output_size + g_output_size)], h = p_output_size * 2 + g_output_size
-        pg, _ = self.linear_fc1(hidden_states)
-        pg = gather_from_tensor_model_parallel_region(pg, group=self.tp_group)
-        nvtx_range_pop(suffix="fan_fc1")
-
-        nvtx_range_push(suffix="fan_activation")
-        p, g = pg.split(self.fused_dims, dim=-1)
-        if self.activation_func is not None:
-            fan_hidden = torch.cat((torch.cos(p), torch.sin(p), self.activation_func(g)), dim=-1)
+        if self.fan_no_compress:
+            # No fc1 compression: apply sin/cos directly on hidden_states.
+            # fan_hidden has 2× hidden_size.
+            nvtx_range_push(suffix="fan_no_compress_sincos")
+            fan_hidden = torch.cat(
+                (torch.cos(hidden_states), torch.sin(hidden_states)), dim=-1
+            )
+            nvtx_range_pop(suffix="fan_no_compress_sincos")
         else:
-            fan_hidden = torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)
-        nvtx_range_pop(suffix="fan_activation")
+            nvtx_range_push(suffix="fan_fc1")
+            # [sq, b, h] --> [sq, b, (p_output_size + g_output_size)], h = p_output_size * 2 + g_output_size
+            pg, _ = self.linear_fc1(hidden_states)
+            pg = gather_from_tensor_model_parallel_region(pg, group=self.tp_group)
+            nvtx_range_pop(suffix="fan_fc1")
+
+            nvtx_range_push(suffix="fan_activation")
+            p, g = pg.split(self.fused_dims, dim=-1)
+            if self.activation_func is not None:
+                fan_hidden = torch.cat((torch.cos(p), torch.sin(p), self.activation_func(g)), dim=-1)
+            else:
+                fan_hidden = torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)
+            nvtx_range_pop(suffix="fan_activation")
 
         return hidden_states, fan_hidden
 
@@ -346,7 +372,7 @@ class FanQKVLinear(MegatronModule):
             self.linear_fc2_k.backward_dw()
         if self.linear_fc2_v is not None and hasattr(self.linear_fc2_v, "backward_dw"):
             self.linear_fc2_v.backward_dw()
-        if hasattr(self.linear_fc1, "backward_dw"):
+        if self.linear_fc1 is not None and hasattr(self.linear_fc1, "backward_dw"):
             self.linear_fc1.backward_dw()
 
 
@@ -390,14 +416,45 @@ class FanLayer(FanQKVLinear):
         self.linear_fc2_q = None
         self.linear_fc2_k = None
         self.linear_fc2_v = None
-        self.linear_fc2 = IdentityOp()
+        if self.fan_no_compress:
+            # Need fc2 to project 2*hidden_size → hidden_size.
+            # Parent may have built one (non-qk-fan path); if not, build here.
+            if self.linear_fc2 is None:
+                self.linear_fc2 = build_module(
+                    submodules.linear_fc2,
+                    2 * hidden_size,
+                    hidden_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=config.add_bias_linear,
+                    gather_output=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name="fan_norm_fc2",
+                    tp_group=self.tp_group,
+                )
+        else:
+            self.linear_fc2 = IdentityOp()
 
     def forward(self, hidden_states, **kwargs):
         """Return a single tensor, matching the layernorm interface."""
         _, fan_hidden = self._fan_transform(hidden_states)
-        # fc1 (SP) does all-gather on seq dim: (seq/tp, b, h) -> (seq, b, ...).
-        # Scatter back so the output shape matches the SP-sharded residual.
-        if getattr(self.config, "sequence_parallel", False):
-            fan_hidden = scatter_to_sequence_parallel_region(fan_hidden)
+        if self.fan_no_compress:
+            # fan_hidden is (seq/tp, b, 2h) in SP, (seq, b, 2h) otherwise.
+            # Apply fc2 to compress 2h → h.
+            fan_hidden, _ = self.linear_fc2(fan_hidden)
+            # After ColumnParallelLinear (with SP): (seq, b, h/tp).
+            # Gather across TP to recover full hidden dim.
+            fan_hidden = gather_from_tensor_model_parallel_region(
+                fan_hidden, group=self.tp_group
+            )
+            # Now (seq, b, h). Scatter back for SP if needed.
+            if getattr(self.config, "sequence_parallel", False):
+                fan_hidden = scatter_to_sequence_parallel_region(fan_hidden)
+        else:
+            # fc1 (SP) does all-gather on seq dim: (seq/tp, b, h) -> (seq, b, ...).
+            # Scatter back so the output shape matches the SP-sharded residual.
+            if getattr(self.config, "sequence_parallel", False):
+                fan_hidden = scatter_to_sequence_parallel_region(fan_hidden)
         return fan_hidden
 

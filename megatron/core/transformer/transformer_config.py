@@ -725,6 +725,10 @@ class TransformerConfig(ModelParallelConfig):
     fan_pre_mlp_norm_enabled: bool = False
     """Whether to replace pre_mlp_layernorm (RMSNorm) with a FAN-based transformation (FanNorm)."""
 
+    fan_no_compress: bool = False
+    """Skip FAN fc1 compression; apply sin/cos directly on hidden states,
+    then fc2 compresses 2*hidden_size to the target output dimension."""
+
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
 
@@ -803,8 +807,8 @@ class TransformerConfig(ModelParallelConfig):
                     "Use recompute_granularity=None or 'selective'."
                 )
 
-        # FAN-QKV validation
-        if self.fan_qkv_enabled:
+        # FAN-QKV validation (skip fc1 dim checks when fan_no_compress is set)
+        if self.fan_qkv_enabled and not self.fan_no_compress:
             if not (0.0 <= self.fan_p_ratio <= 0.5):
                 raise ValueError(
                     f"fan_p_ratio must be within [0, 0.5], but got {self.fan_p_ratio}."
