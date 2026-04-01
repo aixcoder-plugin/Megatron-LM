@@ -718,6 +718,9 @@ class TransformerConfig(ModelParallelConfig):
 
     fan_enable_qk_fan: bool = True
     """Whether to enable qk for FAN fc1 projection (shared for p and g parts)."""
+
+    fan_enable_v_fan: bool = False
+    """When fan_enable_qk_fan is True, whether V also consumes FAN-transformed hidden states."""
     
     fan_layer_no_norm_enabled: bool = False
     """Whether to disable FAN layer normalization."""

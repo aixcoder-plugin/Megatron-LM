@@ -1704,6 +1704,12 @@ def _add_fan_layer_args(parser):
         dest='fan_enable_qk_fan',
     )
     group.add_argument(
+        '--fan-enable-v-fan',
+        action='store_true',
+        help='When q/k FAN is enabled, feed V projection with FAN-transformed hidden states.',
+        dest='fan_enable_v_fan',
+    )
+    group.add_argument(
         '--fan-layer-no-norm-enabled',
         action='store_true',
         help='Disable FAN layer normalization.',
@@ -1723,7 +1729,7 @@ def _add_fan_layer_args(parser):
              'states, then fc2 compresses 2*hidden_size to the target output.',
         dest='fan_no_compress',
     )
-    group.set_defaults(fan_use_p_bias=True)
+    group.set_defaults(fan_use_p_bias=True, fan_enable_v_fan=False)
 
     return parser
 

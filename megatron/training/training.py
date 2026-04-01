@@ -731,7 +731,7 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
 
     # Optionally visualize model structure (text + SVG).
-    if getattr(args, 'visualize_model_structure', False):
+    if getattr(args, 'visualize_model_structure', True):
         _visualize_model_structure(model, args)
 
     config = get_model_config(model[0])

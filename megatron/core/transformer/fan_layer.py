@@ -8,6 +8,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
+    scatter_to_tensor_model_parallel_region,
 )
 from megatron.core.utils import (
     divide,
@@ -66,6 +67,7 @@ class FanQKVLinear(MegatronModule):
         submodules: Optional[FanSubmodules] = None,
         p_ratio: Optional[float] = None,
         use_p_bias: Optional[bool] = None,
+        fc1_output_size: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(config=config)
@@ -93,10 +95,16 @@ class FanQKVLinear(MegatronModule):
         assert 0.0 <= self.p_ratio <= 0.5, "p_ratio must be between 0 and 0.5"
 
         self.fan_no_compress = getattr(self.config, "fan_no_compress", False)
+        self.fan_enable_v_fan = getattr(self.config, "fan_enable_v_fan", False)
+        if self.fan_enable_v_fan:
+            assert self.config.fan_enable_qk_fan, "fan_enable_v_fan must be used with fan_enable_qk_fan"
 
-
-        p_output_size = int(self.input_size * self.p_ratio)
-        g_output_size = self.input_size - p_output_size * 2
+        if fc1_output_size is not None:
+            p_output_size = int(fc1_output_size * self.p_ratio)
+            g_output_size = fc1_output_size - p_output_size * 2
+        else:
+            p_output_size = int(self.input_size * self.p_ratio)
+            g_output_size = self.input_size - p_output_size * 2
         self.fused_dims = (p_output_size, g_output_size)
 
         if self.fan_no_compress:
@@ -193,19 +201,40 @@ class FanQKVLinear(MegatronModule):
                 tp_comm_buffer_name=f"{tp_comm_buffer_name}_fan_fc2_k",
                 tp_group=tp_group,
             )
-            self.linear_fc2_v = build_module(
-                submodules.linear_fc2,
-                self.input_size,
-                self.kv_projection_size,
-                config=self.config,
-                init_method=init_method,
-                gather_output=gather_output,
-                bias=bias,
-                skip_bias_add=skip_bias_add,
-                is_expert=is_expert,
-                tp_comm_buffer_name=f"{tp_comm_buffer_name}_fan_fc2_v",
-                tp_group=tp_group,
-            )
+            if self.fan_enable_v_fan and not isinstance(self, FanLayer):
+                self.linear_fc2_v = FanLayer(
+                    config=self.config,
+                    hidden_size=self.input_size,
+                    submodules=FanSubmodules(
+                        input_layernorm=IdentityOp,
+                        linear_fc1=submodules.linear_fc1,
+                        activation_func=submodules.activation_func,
+                        linear_fc2=IdentityOp,
+                    ),
+                    p_ratio=self.p_ratio,
+                    use_p_bias=self.use_p_bias,
+                    output_size=self.kv_projection_size,
+                    gather_output=gather_output,
+                    bias=bias,
+                    skip_bias_add=skip_bias_add,
+                    is_expert=is_expert,
+                    tp_comm_buffer_name=f"{tp_comm_buffer_name}_fan_fc2_v",
+                    tp_group=tp_group,
+                )
+            else:
+                self.linear_fc2_v = build_module(
+                    submodules.linear_fc2,
+                    self.input_size,
+                    self.kv_projection_size,
+                    config=self.config,
+                    init_method=init_method,
+                    gather_output=gather_output,
+                    bias=bias,
+                    skip_bias_add=skip_bias_add,
+                    is_expert=is_expert,
+                    tp_comm_buffer_name=f"{tp_comm_buffer_name}_fan_fc2_v",
+                    tp_group=tp_group,
+                )
 
             if getattr(self.config, "sequence_parallel", False) and not self.fan_no_compress:
                 self.__set_disable_sequence_parallel(self.linear_fc2_q)
@@ -213,8 +242,8 @@ class FanQKVLinear(MegatronModule):
                 # NOTE: Keep sequence-parallel semantics for V.
                 # - Q/K consume `fan_hidden`, which is already full-seq (linear_fc1 does SP all-gather),
                 #   so we must disable SP to avoid gathering again.
-                # - V consumes the original `hidden_states`, which may still be sequence-parallel
-                #   (sharded along dim0), so we keep SP enabled on linear_fc2_v to all-gather.
+                # - V either consumes the original `hidden_states` with a direct linear projection,
+                #   or runs through an inner `FanLayer` that handles its own sequence-parallel logic.
                 # When fan_no_compress is True, fan_hidden is still SP-sharded (no fc1 all-gather),
                 # so Q/K also need SP to all-gather the seq dim.
 
@@ -320,7 +349,10 @@ class FanQKVLinear(MegatronModule):
             # [sq, b, h] --> [sq, b, kv_channels * num_query_groups/tp_size]
             output_k, _ = self.linear_fc2_k(fan_hidden)
             # [sq, b, h] --> [sq, b, kv_channels * num_query_groups/tp_size]
-            output_v, _ = self.linear_fc2_v(hidden_states)
+            if self.fan_enable_v_fan:
+                output_v = self.linear_fc2_v(hidden_states)
+            else:
+                output_v, _ = self.linear_fc2_v(hidden_states)
 
             # [sq, b, kv_channels * num_attention_heads/tp_size] --> [sq, b, num_query_groups/tp_size, kv_channels * num_attention_heads // tp_size // (num_query_groups/tp_size)]
             output_q = output_q.view(
@@ -397,22 +429,40 @@ class FanLayer(FanQKVLinear):
         submodules: Optional[FanSubmodules] = None,
         p_ratio: Optional[float] = None,
         use_p_bias: Optional[bool] = None,
+        output_size: Optional[int] = None,
+        gather_output: bool = False,
+        bias: Optional[bool] = None,
+        skip_bias_add: bool = False,
+        is_expert: bool = False,
         **kwargs,
     ):
+        output_size = hidden_size if output_size is None else output_size
+        bias = config.add_bias_linear if bias is None else bias
+        tp_comm_buffer_name = kwargs.pop("tp_comm_buffer_name", "fan_norm")
+        tp_group = kwargs.pop("tp_group", None)
         super().__init__(
             input_size=hidden_size,
-            output_size=hidden_size,
+            output_size=output_size,
+            fc1_output_size=output_size,
             config=config,
             init_method=config.init_method,
-            bias=config.add_bias_linear,
-            gather_output=False,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="fan_norm",
+            bias=bias,
+            gather_output=gather_output,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
             submodules=submodules,
             p_ratio=p_ratio,
             use_p_bias=use_p_bias,
         )
+        self.project_output = output_size != hidden_size
+        self.project_gather_output = gather_output
+        if self.project_output:
+            assert (
+                not self.fan_no_compress
+            ), "FanLayer output projection does not support fan_no_compress"
+
         self.linear_fc2_q = None
         self.linear_fc2_k = None
         self.linear_fc2_v = None
@@ -439,6 +489,12 @@ class FanLayer(FanQKVLinear):
     def forward(self, hidden_states, **kwargs):
         """Return a single tensor, matching the layernorm interface."""
         _, fan_hidden = self._fan_transform(hidden_states)
+        if self.project_output:
+            if not self.project_gather_output:
+                fan_hidden = scatter_to_tensor_model_parallel_region(
+                    fan_hidden, group=self.tp_group
+                )
+            return fan_hidden
         if self.fan_no_compress:
             # fan_hidden is (seq/tp, b, 2h) in SP, (seq, b, 2h) otherwise.
             # Apply fc2 to compress 2h → h.
