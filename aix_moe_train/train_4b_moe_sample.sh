@@ -10,18 +10,19 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 #export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN:-16}
 #export NCCL_P2P_NET_CHUNKSIZE=${NCCL_P2P_NET_CHUNKSIZE:-2097152}
 #export NCCL_AVOID_RECORD_STREAMS=${NCCL_AVOID_RECORD_STREAMS:-1}
-
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 set +x
 
 ProjectPath="/models/nemotron_cc_v2_high_sample_50B/sample_100k"
 
-CHECKPOINT_PATH=${1:-"${ProjectPath}/checkpoints/4b_moe_bf16"}
-TENSORBOARD_LOGS_PATH=${2:-"${ProjectPath}/tensorboard_logs/4b_moe_bf16"}
+EXP_NAME="${EXP_NAME:-"4b_moe_bf16_baseline_sample"}"
+CHECKPOINT_PATH=${1:-"${ProjectPath}/checkpoints/${EXP_NAME}"}
+TENSORBOARD_LOGS_PATH=${2:-"${ProjectPath}/tensorboard_logs/${EXP_NAME}"}
 TOKENIZER_ARG=${3:-"/models/Qwen3-30B-A3B"}
 DATA_ARG=${4:-"${ProjectPath}/nemotraon_ccv2_sample_100k_processed_data_text_document"}
 
-DATA_CACHE_PATH="${ProjectPath}/data_cache_4b_moe_bf16"
+DATA_CACHE_PATH="${CHECKPOINT_PATH}/data_cache_${EXP_NAME}"
 mkdir -p "$DATA_CACHE_PATH"
 
 
@@ -86,8 +87,6 @@ MODEL_ARGS=(
 )
 
 FanStack_ARGS=(
-    --fan-layer-enabled
-    --fan-p-ratio 0.25
 )
 
 MOE_ARGS=(

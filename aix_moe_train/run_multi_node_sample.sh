@@ -51,10 +51,10 @@ IMAGE_NAME="${IMAGE_NAME:-"nvcr.io/nvidia/pytorch:25.04-py3-megatron-260115"}"
 WORKDIR="${WORKDIR:-"/nfs100/jiangsiyuan/Megatron-LM"}"
 
 # 容器名前缀：每个节点会追加 -r${NODE_RANK}
-CONTAINER_NAME_PREFIX="${CONTAINER_NAME_PREFIX:-"megatron_4b_moe_with_fan_stack_sample"}"
+CONTAINER_NAME_PREFIX="${CONTAINER_NAME_PREFIX:-"megatron_4b_moe_sample"}"
 
 # 训练脚本（容器内路径，默认相对 WORKDIR）
-TRAIN_SCRIPT_REL="${TRAIN_SCRIPT_REL:-"aix_moe_train/train_4b_moe_with_fan_stack_sample.sh"}"
+TRAIN_SCRIPT_REL="${TRAIN_SCRIPT_REL:-"aix_moe_train/train_4b_moe_sample.sh"}"
 
 
 IB_IFNAME="${IB_IFNAME:-"ibp185s0"}"
@@ -190,6 +190,7 @@ ${DOCKER_BIN} run -it -d --gpus all --net=host \\
   -e NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL} \\
   -e NCCL_DEBUG=${NCCL_DEBUG} \\
   -e CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS} \\
+  -e EXP_NAME=${CONTAINER_NAME_PREFIX} \\
   ${DOCKER_MOUNTS[*]} \\
   ${IMAGE_NAME} \\
   ${container_cmd}

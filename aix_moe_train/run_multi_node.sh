@@ -54,13 +54,14 @@ WORKDIR="${WORKDIR:-"/nfs100/jiangsiyuan/Megatron-LM"}"
 CONTAINER_NAME_PREFIX="${CONTAINER_NAME_PREFIX:-"megatron_4b_moe_baseline"}"
 
 # 训练脚本（容器内路径，默认相对 WORKDIR）
-TRAIN_SCRIPT_REL="${TRAIN_SCRIPT_REL:-"aix_moe_train/train_4b_moe_full.sh"}"
+TRAIN_SCRIPT_REL="${TRAIN_SCRIPT_REL:-"aix_moe_train/train_4b_moe_full_new.sh"}"
 
 
 IB_IFNAME="${IB_IFNAME:-"ibp185s0"}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$IB_IFNAME}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$IB_IFNAME}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+# export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_1}"
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-2}"
 export NCCL_DEBUG="${NCCL_DEBUG:-ERROR}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
@@ -77,6 +78,7 @@ SSH_OPTS=(
 DOCKER_MOUNTS=(
   -v /dev/shm:/dev/shm
   -v /models:/models
+  -v /mntdata-2:/mntdata-2
   -v /nfs100:/nfs100
   -v /nfsEDS:/nfsEDS
 )
