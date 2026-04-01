@@ -827,9 +827,10 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
 
             state_dict['optimizer'] = optimizer_sd
 
-        if opt_param_scheduler is not None:
-            state_dict['opt_param_scheduler'] = \
-                opt_param_scheduler.state_dict()
+    # Always persist the scheduler state. It is tiny compared to optimizer
+    # shards and lets model-only resumes continue from the correct LR point.
+    if opt_param_scheduler is not None:
+        state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
 
     # Rerun state
     if rerun_state:
@@ -1675,12 +1676,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.load_parameter_state(optim_checkpoint_name,
                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
 
-            # Load scheduler.
-            if opt_param_scheduler is not None:
-                if 'lr_scheduler' in state_dict: # backward compatbility
-                    opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
-                else:
-                    opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
         except KeyError as e:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
@@ -1693,6 +1688,25 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
                 optimizer.reload_model_params()
+
+    # LR scheduler state is tiny and can be restored independently of optimizer
+    # state. Fall back to consumed samples for older checkpoints that do not
+    # save scheduler metadata.
+    if not release and not args.finetune and opt_param_scheduler is not None:
+        if 'lr_scheduler' in state_dict:  # backward compatibility
+            opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
+        elif 'opt_param_scheduler' in state_dict:
+            opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+        else:
+            scheduler_steps = args.consumed_train_samples
+            if scheduler_steps == 0 and iteration > 0:
+                scheduler_steps = iteration * args.global_batch_size
+            if scheduler_steps > 0:
+                opt_param_scheduler.step(increment=scheduler_steps)
+                print_rank_0(
+                    'Scheduler state missing in checkpoint; fast-forwarded '
+                    f'LR scheduler to {scheduler_steps} consumed samples.'
+                )
 
     # rerun state
     if not ignore_rerun_state:
