@@ -14,13 +14,28 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 set +x
 
-ProjectPath="/mntdata-2/data"
+ProjectPath="/mntdata-2/data-100B"
 
 EXP_NAME="${EXP_NAME:-"1b_debse_baseline"}"
 CHECKPOINT_PATH=${1:-"${ProjectPath}/checkpoints/${EXP_NAME}"}
 TENSORBOARD_LOGS_PATH=${2:-"${ProjectPath}/tensorboard_logs/${EXP_NAME}"}
 TOKENIZER_ARG=${3:-"/models/Qwen3-30B-A3B"}
-DATA_ARG=${4:-"${ProjectPath}/nemotraon_ccv2_sample_full_processed_data_text_document"}
+DATA_ARG=${4:-""}
+if [ -n "$DATA_ARG" ]; then
+    DATA_PATHS=($DATA_ARG)
+else
+    DATA_PREFIX=aix_sample_100b_multi_source_processed_data
+    DATA_PATHS=(
+        "${ProjectPath}/${DATA_PREFIX}_0_text_document"
+        "${ProjectPath}/${DATA_PREFIX}_1_text_document"
+        "${ProjectPath}/${DATA_PREFIX}_2_text_document"
+        "${ProjectPath}/${DATA_PREFIX}_3_text_document"
+        "${ProjectPath}/${DATA_PREFIX}_4_text_document"
+        "${ProjectPath}/${DATA_PREFIX}_5_text_document"
+        "${ProjectPath}/${DATA_PREFIX}_6_text_document"
+        "${ProjectPath}/${DATA_PREFIX}_7_text_document"
+    )
+fi
 DATA_CACHE_PATH="${CHECKPOINT_PATH}/data_cache_${EXP_NAME}"
 mkdir -p "$DATA_CACHE_PATH"
 
@@ -44,8 +59,8 @@ PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 TP_SIZE=8
 CP_SIZE=1
 PP_SIZE=1
-MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=128
+MICRO_BATCH_SIZE=2
+GLOBAL_BATCH_SIZE=160
 NUM_LAYERS=48
 DTYPE="bf16"
 SEQ_LENGTH=4096
@@ -87,6 +102,13 @@ MODEL_ARGS=(
 )
 
 FanStack_ARGS=(
+    --fan-layer-enabled
+    --fan-p-ratio 0.125
+    --fan-enable-v-fan
+    --stack-memory-enabled
+    --stack-memory-slots 24
+    --stack-memory-num-heads 8
+    --stack-memory-dim 16
 )
 
 MOE_ARGS=(
@@ -95,9 +117,9 @@ MOE_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
-    --train-samples 5088315
-    --lr-decay-samples 1600000
-    --lr-warmup-samples 6400
+    --train-samples 30694000 # 10176630 for 40B  30694000 for 120B
+    --lr-decay-samples 26000000 # 8000000 for 40B  26000000 for 120B
+    --lr-warmup-samples 64000 # 12000 for 40B  64000 for 120B
     --lr 0.00002
     --min-lr 0.000001
     --decoupled-lr 2.0e-5      # Specific to decoupled AdamW, ensure optimizer is compatible
@@ -138,23 +160,24 @@ TRAINING_ARGS+=("${DDP_ARGS[@]}")
 # Data arguments (conditional for mock vs real data)
 DATA_ARGS_LIST=()
 DATA_ARGS_LIST+=(
-    "--data-path $DATA_ARG"
-    "--tokenizer-type HuggingFaceTokenizer" 
-    "--tokenizer-model $TOKENIZER_ARG"
-    "--data-cache-path ${DATA_CACHE_PATH}"
-    "--split '98,2,0'"
+    --data-path "${DATA_PATHS[@]}"
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model "$TOKENIZER_ARG"
+    --data-cache-path "$DATA_CACHE_PATH"
+    --split 99,1,0
+    --dataloader-type cyclic
     "--no-create-attention-mask-in-dataloader"
     "--no-mmap-bin-files"
-    "--num-workers 8"
+    --num-workers 8
     # Note: --vocab-size might be inferred by HuggingFaceTokenizer or might need to be explicit.
-    "--vocab-size 151936"
+    --vocab-size 151936
 )
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 40
-    --eval-iters 50
-    --eval-interval 1000
-    --save-interval 2000
+    --eval-iters 100
+    --eval-interval 4000
+    --save-interval 8000
     --log-throughput
     --profile
     --profile-step-start 4
@@ -171,6 +194,8 @@ LOAD_ARGS=(
     --load "$CHECKPOINT_PATH"
     # --load /models/Qwen3-8B-Base-mcore-tp8/
     --no-load-optim
+    # --finetune
+    --override-opt_param-scheduler
 )
 
 # Ensure pretrain_gpt.py is found
